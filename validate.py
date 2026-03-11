@@ -37,9 +37,9 @@ import torch
 from loguru import logger
 
 # ── Target thresholds ─────────────────────────────────────────────────────────
-TARGET_TOK_PER_S = 800    # tok/s (conservative; 0.6B can hit 1000)
-TARGET_TTFC_MS   = 600    # ms (generous for validate; pipeline target is 60ms)
-TARGET_RTF       = 0.5    # (generous for validate; pipeline target is 0.15)
+TARGET_TOK_PER_S = 1000    # tok/s (conservative; 0.6B can hit 1000)
+TARGET_TTFC_MS   = 60    # ms (generous for validate; pipeline target is 60ms)
+TARGET_RTF       = 0.15    # (generous for validate; pipeline target is 0.15)
 
 PASS = "[✓]"
 FAIL = "[✗]"
