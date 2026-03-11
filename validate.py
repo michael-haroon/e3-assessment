@@ -69,9 +69,20 @@ def test_build_extension() -> bool:
 def test_decoder_speed(n_tokens: int = 100) -> bool:
     print(f"\n── Test 2: Megakernel talker speed ({n_tokens} tokens) ──")
     try:
+        import torch
+        from qwen_tts import Qwen3TTSModel
         from megakernel.tts_talker_decoder import TTSTalkerDecoder
 
-        dec = TTSTalkerDecoder(verbose=False)
+        model_name = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+        logger.info(f"Loading {model_name} for decoder speed test...")
+        qwen_model = Qwen3TTSModel.from_pretrained(
+            model_name,
+            device_map="cuda:0",
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",   # cuDNN FA3 on Blackwell; no flash-attn pkg needed
+        )
+
+        dec = TTSTalkerDecoder(qwen_model=qwen_model, verbose=False)
 
         # Warmup
         dec.reset()

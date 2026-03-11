@@ -18,11 +18,28 @@ vocab_size          151936       151936             shared Qwen tokenizer
 Because every compile-time constant is identical, we compile the kernel once
 and simply pass `num_layers=20` at decode time instead of 28.
 
-Weight layout expected from Qwen3-TTS HF model
-───────────────────────────────────────────────
-The talker LM lives under `talker` (or `model`) in the state dict.
-We detect the key prefix at load time so this works regardless of
-how the checkpoint is structured.
+Weight layout expected from Qwen3-TTS HF model (confirmed via state dict)
+───────────────────────────────────────────────────────────────────────────
+The model is NOT a standard Qwen3ForCausalLM. It is a two-vocabulary model:
+
+  talker.model.text_embedding   (151936, 2048)  text token embedding (2048-dim)
+  talker.text_projection.*                      2048 → 1024 projection
+  talker.model.codec_embedding  (3072, 1024)    codec token embedding (1024-dim)
+  talker.model.layers.X.*                       shared 20-layer transformer
+  talker.model.norm.weight      (1024,)         final RMS norm
+  talker.codec_head.weight      (3072, 1024)    codec output head
+  talker.code_predictor.*                       multi-codebook predictor (15 books)
+
+The megakernel handles ONLY the codec autoregressive decode:
+  input:  codec token id  (0..3071)
+  embed:  talker.model.codec_embedding.weight  row lookup → 1024-dim vector
+  decode: 20 transformer layers
+  output: talker.codec_head.weight @ hidden    → argmax over 3072 classes
+
+The text conditioning path (text_embedding → text_projection → transformer)
+is handled by generate_custom_voice() BEFORE our monkey-patched generate()
+is called. By the time _megakernel_generate() receives input_ids, those ids
+are CODEC token ids, not text ids.
 
 Usage
 ─────
@@ -34,7 +51,9 @@ Usage
 """
 
 import math
+import os
 import struct
+import sys
 import time
 from typing import Iterator, Optional
 
@@ -50,8 +69,16 @@ INTERMEDIATE_SIZE = 3072
 NUM_Q_HEADS       = 16
 Q_SIZE            = NUM_Q_HEADS  * HEAD_DIM   # 2048
 KV_SIZE           = NUM_KV_HEADS * HEAD_DIM   # 1024
-VOCAB_SIZE        = 151936
+
+CODEC_VOCAB_SIZE  = 3072    # codec token vocabulary (talker.codec_head output dim)
+TEXT_VOCAB_SIZE   = 151936  # text tokenizer vocab  (talker.model.text_embedding)
 MAX_SEQ_LEN       = 4096   # Generous for TTS utterances (~1500 codec tokens)
+# NOTE: The megakernel handles ONLY the codec token autoregressive decode loop.
+#   embed  = talker.model.codec_embedding.weight  (3072, 1024)
+#   norm   = talker.model.norm.weight             (1024,)
+#   lm_head = talker.codec_head.weight            (3072, 1024)
+# Text tokens are encoded by a separate path (text_embedding + text_projection)
+# and are NOT part of the megakernel decode path.
 
 
 # ── Helper: build RoPE tables ─────────────────────────────────────────────────
@@ -109,7 +136,8 @@ class TTSTalkerDecoder:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-TTS",
+        qwen_model=None,            # Qwen3TTSModel already loaded by pipeline
+        model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
         verbose: bool = True,
         max_seq_len: int = MAX_SEQ_LEN,
     ):
@@ -118,13 +146,17 @@ class TTSTalkerDecoder:
 
         # ── Build / load extension ────────────────────────────────────────────
         from megakernel.tts_talker_build import get_tts_talker_extension
-        ext = get_tts_talker_extension()
+        get_tts_talker_extension()
         self._decode_op = torch.ops.qwen_tts_talker_C.decode
 
-        # ── Load HF model ─────────────────────────────────────────────────────
-        logger.info(f"Loading {model_name} weights…")
+        # ── Load weights ──────────────────────────────────────────────────────
         t0 = time.perf_counter()
-        self._load_weights(model_name, verbose=verbose)
+        if qwen_model is not None:
+            logger.info("Extracting talker weights from provided Qwen3TTSModel...")
+            self._load_weights_from_model(qwen_model, verbose=verbose)
+        else:
+            logger.info(f"Loading {model_name} weights from HuggingFace...")
+            self._load_weights(model_name, verbose=verbose)
         logger.info(f"Weights loaded in {time.perf_counter() - t0:.1f}s")
 
         # ── KV cache ──────────────────────────────────────────────────────────
@@ -154,46 +186,90 @@ class TTSTalkerDecoder:
 
     # ── Weight loading ────────────────────────────────────────────────────────
 
+    def _load_weights_from_model(self, qwen_model, verbose: bool) -> None:
+        """
+        Extract talker backbone weights from an already-loaded Qwen3TTSModel.
+
+        Avoids a second checkpoint download when the pipeline has already
+        called Qwen3TTSModel.from_pretrained().  We pull state_dict() from
+        qwen_model.model (the inner HF backbone) so the prefix detection
+        logic is shared with the standalone path below.
+
+        The tokenizer is also reused from the qwen_model to avoid a second
+        HF network call.
+        """
+        inner = qwen_model.model          # HF backbone (Qwen3 transformer)
+        state = inner.state_dict()
+
+        prefix = _find_prefix(state, [
+            "talker.model.",    # Qwen3OmniMoeTalker packaging
+            "model.",           # standalone / custom-voice layout
+            "",                 # flat state dict (embed_tokens.weight at root)
+        ])
+        logger.debug(f"Talker weight prefix (from model): '{prefix}'")
+        self._extract_from_state(state, prefix)
+
+        # Reuse tokenizer already bundled inside qwen_model
+        self._tokenizer = getattr(qwen_model, "tokenizer", None)
+
     def _load_weights(self, model_name: str, verbose: bool) -> None:
         """
         Load the talker backbone weights from the Qwen3-TTS HF checkpoint.
 
-        The talker decoder in Qwen3-TTS is a Qwen3-style LM. We extract
-        exactly the 11 per-layer tensors the megakernel expects, plus
-        embed_tokens, model.norm, and lm_head.
-
-        Key prefix detection handles two layouts seen in practice:
-          - "talker.model.layers."  (Qwen3OmniMoeTalker packaging)
-          - "model.layers."         (standalone talker checkpoint)
+        Fallback path used when no pre-loaded Qwen3TTSModel is provided.
+        Uses qwen_tts.Qwen3TTSModel (not AutoModel) because qwen3_tts is not
+        a registered HF architecture in standard transformers releases.
         """
         import os
-        from transformers import AutoModel, AutoTokenizer
+        from qwen_tts import Qwen3TTSModel
 
         token = os.getenv("HF_TOKEN", None)
 
-        # Load the full model in bfloat16 onto CUDA.
-        # We only need the talker LM; thinly-wrapped via AutoModel so we get
-        # the raw state dict without running any forward pass.
-        model = AutoModel.from_pretrained(
+        model = Qwen3TTSModel.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
             device_map="cuda",
-            token=token,
-            trust_remote_code=True,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",   # cuDNN FA3 on Blackwell; no flash-attn pkg needed
         )
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            model_name, token=token, trust_remote_code=True
-        )
-        state = model.state_dict()
+        # Reuse tokenizer bundled in Qwen3TTSModel
+        self._tokenizer = getattr(model, "tokenizer", None)
 
-        # Detect which prefix the talker layers live under
+        inner = model.model          # HF backbone (Qwen3 transformer)
+        state = inner.state_dict()
+
         prefix = _find_prefix(state, [
-            "talker.model.",    # full Qwen3-TTS checkpoint
-            "model.",           # standalone talker checkpoint
+            "talker.model.",
+            "model.",
+            "",
         ])
-
         logger.debug(f"Talker weight prefix detected: '{prefix}'")
+        self._extract_from_state(state, prefix)
 
+        del model
+        torch.cuda.empty_cache()
+
+    def _extract_from_state(self, state: dict, prefix: str) -> None:
+        """
+        Shared weight-extraction logic used by both load paths.
+
+
+
+        Qwen3-TTS talker weight layout (confirmed from state dict inspection):
+
+          talker.model.layers.X.*                 ← transformer layers (prefix = 'talker.model.')
+          talker.model.norm.weight      (1024,)   ← final RMS norm
+          talker.model.codec_embedding.weight     ← codec token embedding (3072, 1024)
+          talker.codec_head.weight      (3072, 1024) ← output projection (ONE level above prefix)
+
+        text_embedding (151936, 2048) and text_projection are NOT used here;
+        those are the conditioning path handled by generate_custom_voice().
+
+        Key lookup strategy for embed / norm / lm_head:
+          - prefix is where layers live, e.g. 'talker.model.'
+          - norm  is at {prefix}norm.weight               → always same level as layers
+          - embed is at {prefix}codec_embedding.weight    → same level as layers
+          - lm_head is ONE level above prefix             → parent_prefix + 'codec_head.weight'
+        """
         # ── Per-layer tensors (11 per layer) ──────────────────────────────────
         layer_tensors = []
         for i in range(NUM_LAYERS):
@@ -212,15 +288,55 @@ class TTSTalkerDecoder:
                 state[p + "mlp.down_proj.weight"].contiguous(),
             ])
 
-        # ── Embedding / norm / lm_head ────────────────────────────────────────
-        embed_key = f"{prefix}embed_tokens.weight"
-        norm_key  = f"{prefix}norm.weight"
-        # lm_head may be tied to embed_tokens or a separate key
-        lm_key    = "lm_head.weight" if "lm_head.weight" in state else embed_key
+        # ── norm: always at same level as layers ──────────────────────────────
+        norm_key = f"{prefix}norm.weight"
+        if norm_key not in state:
+            raise KeyError(f"norm not found at '{norm_key}'. State has {len(state)} keys.")
+
+        # ── embed: codec_embedding is at same level as layers ─────────────────
+        # (text_embedding is 2048-dim and goes through text_projection — not used here)
+        embed_candidates = [
+            f"{prefix}codec_embedding.weight",   # Qwen3-TTS CustomVoice
+            f"{prefix}embed_tokens.weight",      # standard Qwen3 LM layout
+        ]
+        embed_key = next((k for k in embed_candidates if k in state), None)
+        if embed_key is None:
+            raise KeyError(
+                f"Cannot find codec embedding near prefix '{prefix}'. "
+                f"Tried: {embed_candidates}"
+            )
+        logger.debug(f"Using embed key: {embed_key}")
+
+        # ── lm_head: one level above prefix (talker.codec_head, not talker.model.lm_head) ──
+        # Compute parent prefix by stripping the last path component from prefix.
+        # e.g. 'talker.model.' -> parent = 'talker.'
+        parent_prefix = ""
+        stripped = prefix.rstrip(".")
+        if "." in stripped:
+            parent_prefix = stripped.rsplit(".", 1)[0] + "."
+
+        lm_candidates = [
+            f"{parent_prefix}codec_head.weight",   # Qwen3-TTS: talker.codec_head.weight
+            "lm_head.weight",                      # standard: root-level
+            f"{prefix}lm_head.weight",             # same level as layers
+            embed_key,                             # tied weights fallback
+        ]
+        lm_key = next((k for k in lm_candidates if k in state), None)
+        if lm_key is None:
+            raise KeyError(
+                f"Cannot find lm_head near prefix '{prefix}'. Tried: {lm_candidates}"
+            )
+        logger.debug(f"Using lm_head key: {lm_key}")
 
         self._embed_weight      = state[embed_key].contiguous()
         self._final_norm_weight = state[norm_key].contiguous()
         self._lm_head_weight    = state[lm_key].contiguous()
+
+        logger.debug(
+            f"Weight shapes — embed: {tuple(self._embed_weight.shape)}, "
+            f"norm: {tuple(self._final_norm_weight.shape)}, "
+            f"lm_head: {tuple(self._lm_head_weight.shape)}"
+        )
 
         # ── RoPE tables ───────────────────────────────────────────────────────
         self._cos_table, self._sin_table = _build_rope_tables(self._max_seq_len)
@@ -230,9 +346,6 @@ class TTSTalkerDecoder:
 
         # Keep layer tensors alive (prevent GC of GPU memory)
         self._layer_tensors_ref = layer_tensors
-
-        del model
-        torch.cuda.empty_cache()
 
     # ── Public API ────────────────────────────────────────────────────────────
 

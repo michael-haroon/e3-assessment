@@ -31,12 +31,46 @@ fi
 CUDA_VER=$(python3 -c "import torch; print(torch.version.cuda)")
 echo "CUDA version: $CUDA_VER"
 
-# ── 1. Python dependencies ────────────────────────────────────────────────────
+# ── 1. System packages ───────────────────────────────────────────────────────
+echo ""
+echo "Installing system packages..."
+apt-get install -y -q sox libsox-dev ffmpeg 2>/dev/null || \
+  echo "  WARNING: apt-get failed (non-root?). Install sox manually if audio I/O errors appear."
+
+# ── 2. Python dependencies ────────────────────────────────────────────────────
 echo ""
 echo "Installing Python requirements..."
 pip install -q -r requirements.txt
 
-# ── 2. Build the megakernel CUDA extension ────────────────────────────────────
+# ── 3. Verify transformers >= 4.52.0 (needed for qwen3_tts architecture) ─────
+echo ""
+echo "Checking transformers version..."
+python3 - <<'PYEOF'
+import importlib.metadata, sys
+from packaging.version import Version
+
+try:
+    ver = Version(importlib.metadata.version("transformers"))
+except importlib.metadata.PackageNotFoundError:
+    ver = Version("0")
+
+MIN_VER = Version("4.52.0")
+print(f"  transformers installed: {ver}")
+
+if ver < MIN_VER:
+    print(f"  {ver} < {MIN_VER} — qwen3_tts not supported. Installing from source...")
+    import subprocess, sys
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "-q",
+        "git+https://github.com/huggingface/transformers.git"
+    ])
+    new_ver = Version(importlib.metadata.version("transformers"))
+    print(f"  Installed from source: {new_ver}")
+else:
+    print(f"  OK — {ver} >= {MIN_VER}")
+PYEOF
+
+# ── 4. Build the megakernel CUDA extension ───────────────────────────────────
 echo ""
 echo "Pre-building qwen_megakernel CUDA extension (sm_120a)..."
 
@@ -71,7 +105,7 @@ ext = get_tts_talker_extension()
 print(f"  TTS talker extension built: {ext}")
 PYEOF
 
-# ── 3. Pull model weights ─────────────────────────────────────────────────────
+# ── 5. Pull model weights ────────────────────────────────────────────────────
 if [[ "$SKIP_WEIGHTS" == "false" ]]; then
   echo ""
   echo "Downloading Qwen3-TTS weights from HuggingFace..."
@@ -82,9 +116,9 @@ import os
 
 token = os.getenv("HF_TOKEN", None)
 
-print("  Qwen/Qwen3-TTS ...")
+print("  Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice ...")
 snapshot_download(
-    "Qwen/Qwen3-TTS",
+    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
     token=token,
     ignore_patterns=["*.msgpack", "*.h5", "flax_model*"],
 )
@@ -92,7 +126,7 @@ print("  Done.")
 PYEOF
 fi
 
-# ── 4. Copy .env ──────────────────────────────────────────────────────────────
+# ── 6. Copy .env ─────────────────────────────────────────────────────────────
 if [[ ! -f ".env" ]]; then
   cp .env.example .env
   echo ""
