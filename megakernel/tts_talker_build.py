@@ -55,13 +55,14 @@ def get_tts_talker_extension():
 
     from torch.utils.cpp_extension import load
 
-    # Build flags for the TTS talker kernel (vocab_size=3072, 20 layers).
-    # LDG_LM_NUM_BLOCKS is scaled down proportionally from 1280 to 12
-    # to match the smaller codec vocab (3072 vs 151936).
+    # Build flags for the TTS talker kernel (20 layers, LM head scaled to
+    # codec vocab). LDG_VOCAB_SIZE is hardcoded as a constexpr in kernel.cu
+    # (line 74) so no compile flag is needed here.
+    # LDG_LM_NUM_BLOCKS=12 is scaled down from 1280 proportionally to the
+    # codec vocab size (3072 vs 151936).
     KERNEL_FLAGS = [
         f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 128)}",
         f"-DLDG_BLOCK_SIZE={_env_int('LDG_BLOCK_SIZE', 512)}",
-        f"-DLDG_VOCAB_SIZE={_env_int('LDG_VOCAB_SIZE', 3072)}",
         f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 12)}",
         f"-DLDG_LM_BLOCK_SIZE={_env_int('LDG_LM_BLOCK_SIZE', 384)}",
         f"-DLDG_LM_ROWS_PER_WARP={_env_int('LDG_LM_ROWS_PER_WARP', 2)}",
