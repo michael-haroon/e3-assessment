@@ -64,6 +64,12 @@ TTS_CHANNELS    = 1
 _CHUNK_SAMPLES = int(TTS_SAMPLE_RATE * 0.15)   # 3600 samples
 _CHUNK_BYTES   = _CHUNK_SAMPLES * 2             # int16 -> 7200 bytes
 
+_ADAPTIVE_MAX_NEW_TOKENS = os.getenv("TTS_ADAPTIVE_MAX_NEW_TOKENS", "0") != "0"
+_MIN_NEW_TOKENS = int(os.getenv("TTS_MIN_NEW_TOKENS", "96"))
+_TOKENS_PER_CHAR = float(os.getenv("TTS_TOKENS_PER_CHAR", "2.6"))
+_SENTENCE_BONUS = int(os.getenv("TTS_SENTENCE_TOKEN_BONUS", "24"))
+_SHORT_TEXT_CHARS = int(os.getenv("TTS_SHORT_TEXT_CHARS", "80"))
+_SHORT_TEXT_MAX_NEW_TOKENS = int(os.getenv("TTS_SHORT_TEXT_MAX_NEW_TOKENS", "180"))
 
 class Qwen3TTSPipeline:
     """
@@ -91,6 +97,7 @@ class Qwen3TTSPipeline:
         self._qwen_model = None   # Qwen3TTSModel
         self._talker     = None   # TTSTalkerDecoder (megakernel)
         self._loaded     = False
+        self._cuda_poisoned = False
 
         if verbose:
             logger.info("Qwen3TTSPipeline created -- weights load on first call")
@@ -136,11 +143,16 @@ class Qwen3TTSPipeline:
         Async generator: text -> int16 PCM bytes chunks (24 kHz, mono).
         Runs blocking synthesis in executor, then chunks and yields.
         """
+        if self._cuda_poisoned:
+            raise RuntimeError("TTS CUDA context is in a failed state; restart the worker process")
+
         self._ensure_loaded()
 
         loop = asyncio.get_event_loop()
+        target_tokens = self._estimate_max_new_tokens(text)
+        logger.debug(f"TTS token budget: {target_tokens} (text_len={len(text)})")
         audio_np, elapsed = await loop.run_in_executor(
-            None, self._synthesize_blocking, text
+            None, self._synthesize_blocking, text, target_tokens
         )
 
         audio_dur = len(audio_np) / TTS_SAMPLE_RATE
@@ -157,17 +169,53 @@ class Qwen3TTSPipeline:
             yield audio_bytes[offset : offset + _CHUNK_BYTES]
             await asyncio.sleep(0)
 
-    def _synthesize_blocking(self, text: str) -> tuple:
+    @staticmethod
+    def _is_fatal_cuda_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "cuda" in msg and (
+            "illegal memory access" in msg
+            or "device-side assert" in msg
+            or "device kernel image is invalid" in msg
+        )
+
+    def _handle_fatal_cuda_error(self, exc: Exception) -> None:
+        self._cuda_poisoned = True
+        logger.error(
+            "Fatal CUDA error in TTS decode; skipping fallback because CUDA context is likely poisoned. "
+            "Please restart the worker process."
+        )
+
+    def _synthesize_blocking(self, text: str, max_new_tokens: int) -> tuple:
         """Blocking synthesis -- runs in thread-pool executor."""
         t0 = time.perf_counter()
         try:
-            audio = self._synthesize_with_megakernel(text)
+            audio = self._synthesize_with_megakernel(text, max_new_tokens)
         except Exception as e:
+            if self._is_fatal_cuda_error(e):
+                self._handle_fatal_cuda_error(e)
+                raise
             logger.warning(f"Megakernel failed ({e!r}) -- falling back to native generate")
-            audio = self._synthesize_fallback(text)
+            audio = self._synthesize_fallback(text, max_new_tokens)
         return audio, time.perf_counter() - t0
 
-    def _synthesize_with_megakernel(self, text: str) -> np.ndarray:
+
+    def _estimate_max_new_tokens(self, text: str) -> int:
+        """Estimate per-request token budget tuned for lower conversational latency."""
+        if not _ADAPTIVE_MAX_NEW_TOKENS:
+            return self.max_new_tokens
+
+        stripped = text.strip()
+        n_chars = len(stripped)
+        est = int(max(_MIN_NEW_TOKENS, n_chars * _TOKENS_PER_CHAR))
+        if stripped.endswith((".", "!", "?")):
+            est += _SENTENCE_BONUS
+
+        if n_chars <= _SHORT_TEXT_CHARS:
+            est = min(est, _SHORT_TEXT_MAX_NEW_TOKENS)
+
+        return max(1, min(est, self.max_new_tokens))
+
+    def _synthesize_with_megakernel(self, text: str, max_new_tokens: int) -> np.ndarray:
         """
         generate_custom_voice() with megakernel replacing the inner LM decode.
 
@@ -252,7 +300,7 @@ class Qwen3TTSPipeline:
                 text=text,
                 language=self.language,
                 speaker=self.speaker,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=max_new_tokens,
             )
         finally:
             inner_lm.generate = original_generate
@@ -261,12 +309,13 @@ class Qwen3TTSPipeline:
         audio = wavs[0]
         return audio.squeeze().astype(np.float32) if audio.ndim > 1 else audio.astype(np.float32)
 
-    def _synthesize_fallback(self, text: str) -> np.ndarray:
+    def _synthesize_fallback(self, text: str, max_new_tokens: int) -> np.ndarray:
         """Plain generate_custom_voice() without megakernel (fallback)."""
         wavs, sr = self._qwen_model.generate_custom_voice(
             text=text,
             language=self.language,
             speaker=self.speaker,
+            max_new_tokens=max_new_tokens,
         )
         self.last_mk_stats = {"fallback": True}
         audio = wavs[0]
