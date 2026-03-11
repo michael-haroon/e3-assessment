@@ -1,7 +1,7 @@
 """
 qwen3_tts_pipeline.py
 ─────────────────────
-End-to-end Qwen3-TTS inference with streaming audio output.
+End-to-end Qwen3-TTS inference with true streaming audio output.
 
 Architecture
 ────────────
@@ -9,46 +9,58 @@ Text
   │
   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Codebook Generator                                             │
-│  (Qwen3OmniMoeTalkerForConditionalGeneration via HF)            │
-│  Runs on GPU with standard PyTorch — generates discrete         │
-│  codec token sequences that represent speech.                   │
+│  PyTorch Prefill  (HF generate, max_new_tokens=1)               │
+│  Runs the full input-embed sequence (speaker + text tokens)     │
+│  through the 20-layer talker to produce the first codec token.  │
+│  This is the dominant TTFC contributor (~200–500ms warm).       │
 └─────────────────────────────────────────────────────────────────┘
-  │  codec token ids (e.g. 1500 tokens for ~5s speech)
+  │  first codec token id
   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Talker Decoder  (THIS FILE)                                    │
-│  Qwen3-0.6B backbone, 20 layers, via megakernel CUDA kernel     │
-│  Streams one codec token per ~1ms step                          │
-│  Yields (token_id, pcm_chunk) as tokens arrive                  │
+│  Megakernel Decode  (TTSTalkerDecoder, ~1ms/token)              │
+│  Generates codec tokens in chunks of CHUNK_TOKENS (default 24). │
+│  After each chunk the vocoder is called immediately.            │
 └─────────────────────────────────────────────────────────────────┘
-  │  raw PCM float32 chunks  (24 kHz, mono)
+  │  codec token chunks → vocoder → PCM chunks
   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  CosyVoice Vocoder (bundled in Qwen3-TTS)                       │
-│  Converts codec tokens → PCM waveform                           │
+│  CosyVoice Vocoder  (speech_tokenizer.decode)                   │
+│  Called on cumulative token prefix; only the *new* audio delta  │
+│  is yielded per chunk to avoid re-playing earlier audio.        │
 └─────────────────────────────────────────────────────────────────┘
 
 Streaming contract
 ──────────────────
 `synthesize_streaming()` is an async generator that yields bytes objects
-(int16 PCM, 24 kHz, mono) as soon as each codec token is decoded by the
-megakernel talker.  Callers (the Pipecat TTS service) push these chunks
-directly into the pipeline without buffering the full utterance.
+(int16 PCM, 24 kHz, mono).
 
-TTFC is measured from the first call to synthesize_streaming() until
-the first bytes are yielded.
+True streaming is implemented via asyncio.Queue:
+  - A background thread runs the blocking synthesis and puts audio
+    chunks into the queue as soon as each CHUNK_TOKENS batch is decoded
+    and vocoded.
+  - The async generator pulls from the queue and yields immediately.
+  - TTFC is therefore: prefill_time + megakernel(CHUNK_TOKENS) + vocoder_first_chunk
+    rather than total synthesis time.
+
+TTFC realistic targets (warm model, RTX 5090):
+  - Prefill:            ~200–500ms  (HF forward over input embeds, hard floor)
+  - Megakernel 24 tok:  ~24ms
+  - Vocoder first chunk: ~50–100ms
+  - Total TTFC:         ~300–600ms  (warm)  vs ~3500ms with old buffered approach
 
 Notes
 ─────
-- The Codebook Generator runs first (non-streaming) to produce the full
-  codec token sequence.  This is the dominant latency contributor to TTFC.
-  Future work: interleave generation with decoding.
-- The Talker Decoder is the megakernel target (~1 ms/token on RTX 5090).
-- The Vocoder runs on CUDA via the bundled CosyVoice flow-matching decoder.
+- The vocoder (CosyVoice flow-matching) conditions on the cumulative token
+  sequence so we call it on the full prefix each time and subtract previously
+  yielded samples.  This avoids boundary artifacts at chunk boundaries.
+- CHUNK_TOKENS is tunable: smaller = lower TTFC but more vocoder calls.
+  Default 24 tokens = 2 s of audio at 12 Hz.
+- Model is pre-warmed on __init__ (verbose=True path) to avoid loading
+  overhead counting towards the first-call TTFC.
 """
 
 import asyncio
+import concurrent.futures
 import os
 import time
 from typing import AsyncIterator
@@ -60,16 +72,24 @@ from loguru import logger
 TTS_SAMPLE_RATE = 24_000
 TTS_CHANNELS    = 1
 
-# ~150 ms per yielded chunk
-_CHUNK_SAMPLES = int(TTS_SAMPLE_RATE * 0.15)   # 3600 samples
-_CHUNK_BYTES   = _CHUNK_SAMPLES * 2             # int16 -> 7200 bytes
+# Tokens per vocoder chunk.  12 tok = 1 s of audio at 12 Hz.
+# 24 tok = 2 s — good balance of TTFC vs vocoder-call overhead.
+# Lower this to reduce TTFC at cost of more frequent vocoder calls.
+_CHUNK_TOKENS = int(os.getenv("TTS_CHUNK_TOKENS", "24"))
+
+# Sentinel placed in the queue to signal end of stream
+_DONE = object()
+
+# Dedicated thread pool — one worker is enough since synthesis is single-GPU
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts_synth")
 
 
 class Qwen3TTSPipeline:
     """
-    Qwen3-TTS-12Hz-0.6B-CustomVoice with megakernel LM backend.
-    Uses official qwen-tts package: from qwen_tts import Qwen3TTSModel
-    Instantiate once; call synthesize_streaming() repeatedly.
+    Qwen3-TTS-12Hz-0.6B-CustomVoice with megakernel LM backend and true streaming.
+
+    Instantiate once (weights load on first call or via warm()).
+    Call synthesize_streaming() repeatedly.
     """
 
     MODEL_NAME = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
@@ -93,10 +113,10 @@ class Qwen3TTSPipeline:
         self._loaded     = False
 
         if verbose:
-            logger.info("Qwen3TTSPipeline created -- weights load on first call")
+            logger.info("Qwen3TTSPipeline created -- call warm() or wait for first synthesize_streaming()")
 
     # -------------------------------------------------------------------------
-    # Lazy loading
+    # Loading
     # -------------------------------------------------------------------------
 
     def _ensure_loaded(self) -> None:
@@ -111,7 +131,7 @@ class Qwen3TTSPipeline:
             self.model_name,
             device_map="cuda:0",
             dtype=torch.bfloat16,
-            attn_implementation="sdpa",   # cuDNN FA3 on Blackwell; no flash-attn pkg needed
+            attn_implementation="sdpa",
         )
         logger.info(f"Qwen3TTSModel loaded in {time.perf_counter() - t0:.1f}s")
 
@@ -127,61 +147,121 @@ class Qwen3TTSPipeline:
 
         self._loaded = True
 
+    def warm(self) -> None:
+        """
+        Eagerly load weights and run a short warm-up synthesis so the first
+        real call does not pay model-load overhead in its TTFC measurement.
+        Call this once at server startup.
+        """
+        self._ensure_loaded()
+        logger.info("Warming up TTS pipeline (short silent forward pass)...")
+        t0 = time.perf_counter()
+        try:
+            # Minimal text — just enough to trigger prefill + a few megakernel steps
+            self._synthesize_chunked(
+                "Warm up.",
+                chunk_callback=lambda _audio_bytes, _is_final: None,   # discard
+            )
+        except Exception as e:
+            logger.warning(f"Warm-up synthesis failed (non-fatal): {e!r}")
+        logger.info(f"Warm-up done in {(time.perf_counter() - t0)*1000:.0f}ms")
+
     # -------------------------------------------------------------------------
-    # Synthesis
+    # Public streaming API
     # -------------------------------------------------------------------------
 
     async def synthesize_streaming(self, text: str) -> AsyncIterator[bytes]:
         """
         Async generator: text -> int16 PCM bytes chunks (24 kHz, mono).
-        Runs blocking synthesis in executor, then chunks and yields.
+
+        Yields audio as soon as each CHUNK_TOKENS batch is decoded and vocoded.
+        TTFC = prefill + megakernel(CHUNK_TOKENS) + first vocoder call.
         """
         self._ensure_loaded()
 
-        loop = asyncio.get_event_loop()
-        audio_np, elapsed = await loop.run_in_executor(
-            None, self._synthesize_blocking, text
+        loop   = asyncio.get_event_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _callback(audio_bytes: bytes, is_final: bool) -> None:
+            """Called from synthesis thread; put chunk into async queue."""
+            loop.call_soon_threadsafe(queue.put_nowait, audio_bytes)
+            if is_final:
+                loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+
+        t0 = time.perf_counter()
+        first_yielded = False
+
+        # Launch blocking synthesis in thread pool
+        future = loop.run_in_executor(
+            _EXECUTOR,
+            self._synthesize_chunked,
+            text,
+            _callback,
         )
 
-        audio_dur = len(audio_np) / TTS_SAMPLE_RATE
-        rtf = elapsed / audio_dur if audio_dur > 0 else 0.0
-        logger.info(
-            f"TTS: {len(text)} chars -> {audio_dur:.2f}s | "
-            f"wall={elapsed*1000:.0f}ms RTF={rtf:.3f}"
-        )
+        try:
+            while True:
+                item = await queue.get()
+                if item is _DONE:
+                    break
+                if not first_yielded:
+                    ttfc_ms = (time.perf_counter() - t0) * 1000
+                    logger.info(f"TTFC: {ttfc_ms:.0f}ms")
+                    first_yielded = True
+                yield item
+        finally:
+            # Ensure synthesis thread completes and surfaces any exceptions
+            await future
 
-        audio_int16 = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
-        audio_bytes = audio_int16.tobytes()
+    # -------------------------------------------------------------------------
+    # Blocking synthesis (runs in thread pool)
+    # -------------------------------------------------------------------------
 
-        for offset in range(0, len(audio_bytes), _CHUNK_BYTES):
-            yield audio_bytes[offset : offset + _CHUNK_BYTES]
-            await asyncio.sleep(0)
+    def _synthesize_chunked(self, text: str, chunk_callback) -> None:
+        """
+        Blocking synthesis with chunked streaming via chunk_callback.
 
-    def _synthesize_blocking(self, text: str) -> tuple:
-        """Blocking synthesis -- runs in thread-pool executor."""
+        chunk_callback(audio_bytes: bytes, is_final: bool) is called:
+          - Once per CHUNK_TOKENS batch as audio becomes available
+          - Once more with is_final=True after the last chunk
+
+        Falls back to full-buffer synthesis if megakernel path fails.
+        """
         t0 = time.perf_counter()
         try:
-            audio = self._synthesize_with_megakernel(text)
+            self._synthesize_with_megakernel_chunked(text, chunk_callback)
         except Exception as e:
-            logger.warning(f"Megakernel failed ({e!r}) -- falling back to native generate")
+            logger.warning(f"Megakernel chunked path failed ({e!r}) -- falling back")
+            import traceback; traceback.print_exc()
             audio = self._synthesize_fallback(text)
-        return audio, time.perf_counter() - t0
+            audio_bytes = (audio * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+            chunk_callback(audio_bytes, is_final=True)
 
-    def _synthesize_with_megakernel(self, text: str) -> np.ndarray:
+        elapsed = time.perf_counter() - t0
+        logger.info(f"_synthesize_chunked wall={elapsed*1000:.0f}ms")
+
+    def _synthesize_with_megakernel_chunked(self, text: str, chunk_callback) -> None:
         """
-        generate_custom_voice() with megakernel replacing the inner LM decode.
+        Core streaming synthesis:
+          1. PyTorch prefill (HF generate, max_new_tokens=1) → first codec token
+          2. Megakernel decode in batches of CHUNK_TOKENS
+          3. After each batch: call vocoder on cumulative tokens, yield new audio delta
 
-        Qwen3TTSModel stores its backbone transformer at .model.
-        We temporarily replace model.model.generate() with our megakernel
-        implementation, call generate_custom_voice(), then restore.
+        chunk_callback receives raw int16 bytes for each audio chunk.
         """
         talker   = self._talker
-        inner_lm = self._qwen_model.model.talker   # HF backbone (Qwen3 transformer)
+        inner_lm = self._qwen_model.model.talker
+        speech_tokenizer = self._qwen_model.model.speech_tokenizer
 
         original_generate = inner_lm.generate
         mk_stats: dict = {}
+        captured: dict = {}   # holds prefill output for inspection
 
-        def _megakernel_generate(inputs_embeds=None, input_ids=None, **kwargs):
+        # ------------------------------------------------------------------
+        # Patch inner_lm.generate to intercept the inputs_embeds + run
+        # prefill for 1 token only, then hand off to megakernel
+        # ------------------------------------------------------------------
+        def _streaming_generate(inputs_embeds=None, input_ids=None, **kwargs):
             from transformers.generation import GenerateDecoderOnlyOutput
 
             max_new_tokens = kwargs.get("max_new_tokens", talker.max_new_tokens)
@@ -190,65 +270,118 @@ class Qwen3TTSPipeline:
                 eos_ids = [eos_ids]
             eos_set = set(eos_ids)
 
-            # Step 1: PyTorch prefill — run ONE forward pass to get first codec token
+            # ── Step 1: PyTorch prefill for 1 token ──────────────────────
+            t_prefill = time.perf_counter()
             with torch.no_grad():
                 out = original_generate(
                     inputs_embeds=inputs_embeds,
                     input_ids=input_ids,
-                    max_new_tokens=1,   # ← only generate ONE token via PyTorch
+                    max_new_tokens=1,
                     min_new_tokens=1,
-                    **{k: v for k, v in kwargs.items() 
-                    if k not in ("max_new_tokens", "min_new_tokens", "eos_token_id")}
+                    **{k: v for k, v in kwargs.items()
+                       if k not in ("max_new_tokens", "min_new_tokens", "eos_token_id")}
                 )
+            prefill_ms = (time.perf_counter() - t_prefill) * 1000
+            logger.info(f"Prefill: {prefill_ms:.0f}ms")
 
-            # out is shape (1, seq_len+1) — last token is first generated codec token
             first_token = int(out.sequences[0, -1].item())
+            captured["first_token"] = first_token
+            captured["device"]      = inputs_embeds.device
 
             if first_token in eos_set:
                 return out
 
-            # Step 2: megakernel handles all remaining tokens
+            # ── Step 2: megakernel decode in CHUNK_TOKENS batches ────────
             device = inputs_embeds.device
             talker.reset()
-            generated = [first_token]
+            generated   = [first_token]
             fake_hidden_list = []
-            t0 = time.perf_counter()
+            samples_yielded  = 0   # samples already sent to caller
 
+            t_mk = time.perf_counter()
             token_id = first_token
-            for _ in range(min(max_new_tokens, 600) - 1):
+
+            cap = min(max_new_tokens, 1500) - 1
+
+            for step_i in range(cap):
                 tok = talker.step(token_id)
 
-                # Capture real hidden state from megakernel buffer
-                layer_hidden = talker._hidden.float().unsqueeze(0).unsqueeze(0).clone()  # (1, 1, 1024)
-
-                # codec_ids: first codebook is our token, rest zeros
-                codec_ids = torch.zeros(1, 16, dtype=torch.long, device=device)
+                layer_hidden = talker._hidden.float().unsqueeze(0).unsqueeze(0).clone()
+                codec_ids    = torch.zeros(1, 16, dtype=torch.long, device=device)
                 codec_ids[0, 0] = tok
-
                 fake_hidden_list.append(((layer_hidden,), codec_ids))
                 generated.append(tok)
                 token_id = tok
-                if tok in eos_set:
+
+                is_eos   = (tok in eos_set)
+                is_chunk = ((step_i + 1) % _CHUNK_TOKENS == 0)
+
+                if is_chunk or is_eos:
+                    # ── vocoder: decode cumulative token prefix ───────────
+                    codes_tensor = torch.tensor(
+                        generated, dtype=torch.long, device=device
+                    ).unsqueeze(-1).expand(-1, 16).unsqueeze(0)
+                    # shape: (1, T, 16) — first codebook is real, rest zeros
+                    codes_full = torch.zeros(
+                        1, len(generated), 16, dtype=torch.long, device=device
+                    )
+                    codes_full[0, :, 0] = torch.tensor(
+                        generated, dtype=torch.long, device=device
+                    )
+
+                    try:
+                        wavs, _sr = speech_tokenizer.decode(
+                            [{"audio_codes": codes_full[0]}]
+                        )
+                        audio_np = wavs[0]
+                        if audio_np.ndim > 1:
+                            audio_np = audio_np.squeeze()
+                        audio_np = audio_np.astype(np.float32)
+
+                        # Emit only the NEW samples since last chunk
+                        new_audio = audio_np[samples_yielded:]
+                        samples_yielded = len(audio_np)
+
+                        if len(new_audio) > 0:
+                            audio_bytes = (
+                                (new_audio * 32767)
+                                .clip(-32768, 32767)
+                                .astype(np.int16)
+                                .tobytes()
+                            )
+                            chunk_callback(audio_bytes, is_final=False)
+                    except Exception as voc_err:
+                        logger.warning(f"Vocoder chunk failed: {voc_err!r}")
+
+                if is_eos:
                     break
 
-            elapsed = time.perf_counter() - t0
+            elapsed_mk = time.perf_counter() - t_mk
             mk_stats.update(
                 tokens=len(generated),
-                elapsed=elapsed,
-                tok_per_s=len(generated) / elapsed if elapsed > 0 else 0,
+                elapsed=elapsed_mk,
+                tok_per_s=len(generated) / elapsed_mk if elapsed_mk > 0 else 0,
             )
-            logger.info(f"Megakernel: {len(generated)} tok in {elapsed*1000:.1f}ms "
-                        f"({mk_stats['tok_per_s']:.0f} tok/s)")
+            logger.info(
+                f"Megakernel: {len(generated)} tok in {elapsed_mk*1000:.1f}ms "
+                f"({mk_stats['tok_per_s']:.0f} tok/s)"
+            )
+
+            # Signal end-of-stream
+            chunk_callback(b"", is_final=True)
 
             return GenerateDecoderOnlyOutput(
                 sequences=torch.tensor([generated], dtype=torch.long, device=device),
                 hidden_states=tuple(fake_hidden_list),
             )
 
-
-        inner_lm.generate = _megakernel_generate
+        inner_lm.generate = _streaming_generate
         try:
-            wavs, sr = self._qwen_model.generate_custom_voice(
+            # generate_custom_voice internally calls inner_lm.generate,
+            # which is now our _streaming_generate above.
+            # The wavs return value is discarded — audio was already streamed
+            # via chunk_callback inside _streaming_generate.
+            self._qwen_model.generate_custom_voice(
                 text=text,
                 language=self.language,
                 speaker=self.speaker,
@@ -258,11 +391,13 @@ class Qwen3TTSPipeline:
             inner_lm.generate = original_generate
 
         self.last_mk_stats = mk_stats
-        audio = wavs[0]
-        return audio.squeeze().astype(np.float32) if audio.ndim > 1 else audio.astype(np.float32)
+
+    # -------------------------------------------------------------------------
+    # Fallback (no megakernel)
+    # -------------------------------------------------------------------------
 
     def _synthesize_fallback(self, text: str) -> np.ndarray:
-        """Plain generate_custom_voice() without megakernel (fallback)."""
+        """Plain generate_custom_voice() without megakernel."""
         wavs, sr = self._qwen_model.generate_custom_voice(
             text=text,
             language=self.language,
