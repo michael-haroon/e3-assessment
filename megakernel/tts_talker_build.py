@@ -2,9 +2,10 @@
 tts_talker_build.py
 -------------------
 Builds the qwen_megakernel CUDA extension compiled for the TTS talker
-(20 layers instead of 28).  We reuse the SAME kernel source from the
-qwen_megakernel submodule — no kernel modifications are needed because
-num_layers is a runtime parameter passed to launch_ldg_decode_*.
+(20 layers instead of 28, vocab_size=3072 instead of 151936).
+
+Source: the local megakernel/ directory (e3-assessment/megakernel/),
+which contains kernel.cu compiled with LDG_VOCAB_SIZE=3072.
 
 Architectural difference vs. Qwen3-0.6B
 ----------------------------------------
@@ -15,41 +16,23 @@ num_q_heads         16              16    (same)
 num_kv_heads        8               8     (same)
 head_dim            128             128   (same)
 intermediate_size   3072            3072  (same)
-num_hidden_layers   28              20    ← only difference
-vocab_size          151936          151936(same, shared tokenizer)
-
-Because every constant except num_layers is identical, the compiled kernel
-binary is 100% compatible.  We simply load the extension once and call
-decode() with num_layers=20.
+num_hidden_layers   28              20    ← runtime arg
+vocab_size          151936          3072  ← compile-time flag
 """
 
 import os
 import sys
 
-# qwen_megakernel lives as a sibling of e3-assessment:
-#   <workspace>/
-#   ├── e3-assessment/    ← this repo
-#   └── qwen_megakernel/  ← AlpinDale's repo (sibling, separate git)
-_HERE       = os.path.dirname(os.path.abspath(__file__))   # e3-assessment/megakernel/
-_E3_ROOT    = os.path.dirname(_HERE)                        # e3-assessment/
-_WORKSPACE  = os.path.dirname(_E3_ROOT)                     # <workspace>/
-_MK_DIR     = os.path.join(_WORKSPACE, "qwen_megakernel")   # <workspace>/qwen_megakernel/
-_CSRC       = os.path.join(_MK_DIR, "csrc")
+# Build from the local megakernel/ directory (this file's directory).
+# kernel.cu here is compiled with LDG_VOCAB_SIZE=3072 (TTS codec vocab).
+_HERE  = os.path.dirname(os.path.abspath(__file__))   # e3-assessment/megakernel/
+_CSRC  = _HERE                                          # kernel.cu / torch_bindings.cpp live here
 
-if not os.path.isdir(_CSRC):
+if not os.path.isfile(os.path.join(_CSRC, "kernel.cu")):
     raise RuntimeError(
-        f"Cannot find qwen_megakernel/csrc at '{_CSRC}'.\n"
-        f"Expected layout:\n"
-        f"  <workspace>/\n"
-        f"  ├── e3-assessment/   (this repo)\n"
-        f"  └── qwen_megakernel/ (AlpinDale's repo — clone it here)\n"
-        f"Run: git clone https://github.com/AlpinDale/qwen_megakernel "
-        f"'{_MK_DIR}'"
+        f"Cannot find kernel.cu at '{_CSRC}'.\n"
+        f"Expected e3-assessment/megakernel/kernel.cu to exist."
     )
-
-# Make qwen_megakernel importable so we can reuse its build logic
-if _MK_DIR not in sys.path:
-    sys.path.insert(0, _MK_DIR)
 
 _tts_talker_ext = None
 
@@ -72,12 +55,14 @@ def get_tts_talker_extension():
 
     from torch.utils.cpp_extension import load
 
-    # Same flags as qwen_megakernel/qwen_megakernel/build.py, just a
-    # different extension name so both can coexist in the same process.
+    # Build flags for the TTS talker kernel (vocab_size=3072, 20 layers).
+    # LDG_LM_NUM_BLOCKS is scaled down proportionally from 1280 to 12
+    # to match the smaller codec vocab (3072 vs 151936).
     KERNEL_FLAGS = [
         f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 128)}",
         f"-DLDG_BLOCK_SIZE={_env_int('LDG_BLOCK_SIZE', 512)}",
-        f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 1280)}",
+        f"-DLDG_VOCAB_SIZE={_env_int('LDG_VOCAB_SIZE', 3072)}",
+        f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 12)}",
         f"-DLDG_LM_BLOCK_SIZE={_env_int('LDG_LM_BLOCK_SIZE', 384)}",
         f"-DLDG_LM_ROWS_PER_WARP={_env_int('LDG_LM_ROWS_PER_WARP', 2)}",
         f"-DLDG_ATTN_BLOCKS={_env_int('LDG_ATTN_BLOCKS', 8)}",
