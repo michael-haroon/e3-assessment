@@ -2,9 +2,10 @@
 tts_talker_build.py
 -------------------
 Builds the qwen_megakernel CUDA extension compiled for the TTS talker
-(20 layers instead of 28).  We reuse the SAME kernel source from the
-qwen_megakernel submodule — no kernel modifications are needed because
-num_layers is a runtime parameter passed to launch_ldg_decode_*.
+(20 layers instead of 28).  We reuse the SAME kernel source from this
+repo (or a vendored megakernel/csrc directory) — no kernel modifications
+are needed because num_layers is a runtime parameter passed to
+launch_ldg_decode_*.
 
 Architectural difference vs. Qwen3-0.6B
 ----------------------------------------
@@ -24,32 +25,28 @@ decode() with num_layers=20.
 """
 
 import os
-import sys
+_HERE = os.path.dirname(os.path.abspath(__file__))  # e3-assessment/megakernel/
 
-# qwen_megakernel lives as a sibling of e3-assessment:
-#   <workspace>/
-#   ├── e3-assessment/    ← this repo
-#   └── qwen_megakernel/  ← AlpinDale's repo (sibling, separate git)
-_HERE       = os.path.dirname(os.path.abspath(__file__))   # e3-assessment/megakernel/
-_E3_ROOT    = os.path.dirname(_HERE)                        # e3-assessment/
-_WORKSPACE  = os.path.dirname(_E3_ROOT)                     # <workspace>/
-_MK_DIR     = os.path.join(_WORKSPACE, "qwen_megakernel")   # <workspace>/qwen_megakernel/
-_CSRC       = os.path.join(_MK_DIR, "csrc")
 
-if not os.path.isdir(_CSRC):
+def _resolve_csrc_dir() -> str:
+    """Prefer vendored csrc/, otherwise use this package's source files."""
+    vendored_csrc = os.path.join(_HERE, "csrc")
+    if os.path.isdir(vendored_csrc):
+        return vendored_csrc
+
+    if all(
+        os.path.isfile(os.path.join(_HERE, filename))
+        for filename in ("torch_bindings.cpp", "kernel.cu")
+    ):
+        return _HERE
+
     raise RuntimeError(
-        f"Cannot find qwen_megakernel/csrc at '{_CSRC}'.\n"
-        f"Expected layout:\n"
-        f"  <workspace>/\n"
-        f"  ├── e3-assessment/   (this repo)\n"
-        f"  └── qwen_megakernel/ (AlpinDale's repo — clone it here)\n"
-        f"Run: git clone https://github.com/AlpinDale/qwen_megakernel "
-        f"'{_MK_DIR}'"
+        "Cannot find megakernel CUDA sources. Checked both: "
+        f"'{vendored_csrc}' and '{_HERE}'."
     )
 
-# Make qwen_megakernel importable so we can reuse its build logic
-if _MK_DIR not in sys.path:
-    sys.path.insert(0, _MK_DIR)
+
+_CSRC = _resolve_csrc_dir()
 
 _tts_talker_ext = None
 
@@ -57,6 +54,11 @@ _tts_talker_ext = None
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     return int(v) if v is not None else default
+
+
+def _compute_arch_flags() -> list[str]:
+    """Keep the current architecture behavior for extension compilation."""
+    return ["-arch=sm_120a"]
 
 
 def get_tts_talker_extension():
@@ -94,21 +96,28 @@ def get_tts_talker_extension():
         "-DLDG_MLP_SMEM",
     ]
 
+    ARCH_FLAGS = _compute_arch_flags()
+
     CUDA_FLAGS = [
         "-O3",
         "--use_fast_math",
         "-std=c++17",
         "--expt-relaxed-constexpr",
-        "-arch=sm_120a",
         f"-I{_CSRC}",
-    ] + KERNEL_FLAGS
+    ] + ARCH_FLAGS + KERNEL_FLAGS
+
+    source_paths = [
+        os.path.join(_CSRC, "torch_bindings.cpp"),
+        os.path.join(_CSRC, "kernel.cu"),
+    ]
+    print(
+        "[tts_talker_build] Compiling extension with "
+        f"sources={source_paths} arch_flags={ARCH_FLAGS}"
+    )
 
     _tts_talker_ext = load(
         name="qwen_tts_talker_C",          # distinct name from base megakernel
-        sources=[
-            os.path.join(_CSRC, "torch_bindings.cpp"),
-            os.path.join(_CSRC, "kernel.cu"),
-        ],
+        sources=source_paths,
         extra_cuda_cflags=CUDA_FLAGS,
         extra_cflags=[f"-I{_CSRC}"],
         verbose=False,
