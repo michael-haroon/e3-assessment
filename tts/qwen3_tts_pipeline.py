@@ -160,7 +160,7 @@ class Qwen3TTSPipeline:
             # Minimal text — just enough to trigger prefill + a few megakernel steps
             self._synthesize_chunked(
                 "Warm up.",
-                chunk_callback=lambda _audio_bytes, _is_final: None,   # discard
+                chunk_callback=lambda *a, **kw: None,   # discard all args
             )
         except Exception as e:
             logger.warning(f"Warm-up synthesis failed (non-fatal): {e!r}")
@@ -184,7 +184,8 @@ class Qwen3TTSPipeline:
 
         def _callback(audio_bytes: bytes, is_final: bool) -> None:
             """Called from synthesis thread; put chunk into async queue."""
-            loop.call_soon_threadsafe(queue.put_nowait, audio_bytes)
+            if audio_bytes:  # skip empty sentinel bytes
+                loop.call_soon_threadsafe(queue.put_nowait, audio_bytes)
             if is_final:
                 loop.call_soon_threadsafe(queue.put_nowait, _DONE)
 
@@ -235,7 +236,7 @@ class Qwen3TTSPipeline:
             import traceback; traceback.print_exc()
             audio = self._synthesize_fallback(text)
             audio_bytes = (audio * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
-            chunk_callback(audio_bytes, is_final=True)
+            chunk_callback(audio_bytes, True)
 
         elapsed = time.perf_counter() - t0
         logger.info(f"_synthesize_chunked wall={elapsed*1000:.0f}ms")
@@ -349,7 +350,7 @@ class Qwen3TTSPipeline:
                                 .astype(np.int16)
                                 .tobytes()
                             )
-                            chunk_callback(audio_bytes, is_final=False)
+                            chunk_callback(audio_bytes, False)
                     except Exception as voc_err:
                         logger.warning(f"Vocoder chunk failed: {voc_err!r}")
 
@@ -367,8 +368,8 @@ class Qwen3TTSPipeline:
                 f"({mk_stats['tok_per_s']:.0f} tok/s)"
             )
 
-            # Signal end-of-stream
-            chunk_callback(b"", is_final=True)
+            # Signal end-of-stream (empty bytes, is_final=True)
+            chunk_callback(b"", True)
 
             return GenerateDecoderOnlyOutput(
                 sequences=torch.tensor([generated], dtype=torch.long, device=device),
