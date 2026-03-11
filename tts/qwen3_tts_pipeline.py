@@ -64,7 +64,6 @@ TTS_CHANNELS    = 1
 _CHUNK_SAMPLES = int(TTS_SAMPLE_RATE * 0.15)   # 3600 samples
 _CHUNK_BYTES   = _CHUNK_SAMPLES * 2             # int16 -> 7200 bytes
 
-
 class Qwen3TTSPipeline:
     """
     Qwen3-TTS-12Hz-0.6B-CustomVoice with megakernel LM backend.
