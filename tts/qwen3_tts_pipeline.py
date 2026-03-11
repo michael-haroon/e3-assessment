@@ -154,16 +154,22 @@ class Qwen3TTSPipeline:
         Call this once at server startup.
         """
         self._ensure_loaded()
-        logger.info("Warming up TTS pipeline (short silent forward pass)...")
+        logger.info("Warming up TTS pipeline (short forward pass, 24 tokens max)...")
         t0 = time.perf_counter()
         try:
-            # Minimal text — just enough to trigger prefill + a few megakernel steps
+            # Save and override max_new_tokens so warm-up exits after one chunk
+            saved = self.max_new_tokens
+            self.max_new_tokens = _CHUNK_TOKENS + 2   # one chunk + a little buffer
             self._synthesize_chunked(
-                "Warm up.",
-                chunk_callback=lambda *a, **kw: None,   # discard all args
+                "Hi.",
+                chunk_callback=lambda *a, **kw: None,
             )
         except Exception as e:
             logger.warning(f"Warm-up synthesis failed (non-fatal): {e!r}")
+        finally:
+            self.max_new_tokens = saved
+            if self._talker is not None:
+                self._talker.max_new_tokens = saved
         logger.info(f"Warm-up done in {(time.perf_counter() - t0)*1000:.0f}ms")
 
     # -------------------------------------------------------------------------
