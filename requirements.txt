@@ -1,0 +1,24 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+torch>=2.7.0
+transformers>=4.51.0
+accelerate>=0.30.0
+huggingface_hub>=0.23.0
+ninja                        # JIT CUDA compilation
+
+# ── Pipecat + transports / services ───────────────────────────────────────────
+pipecat-ai[daily,deepgram,groq,openai,google]>=0.0.60
+daily-python>=0.10.0
+
+# ── Audio ─────────────────────────────────────────────────────────────────────
+soundfile>=0.12.1
+numpy>=1.26.0
+
+# ── Async / server ────────────────────────────────────────────────────────────
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+loguru>=0.7.2
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# ── Benchmarking ──────────────────────────────────────────────────────────────
+rich>=13.7.0
