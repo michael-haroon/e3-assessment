@@ -30,6 +30,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -44,7 +45,6 @@ from pipeline.llm_fallback import build_llm_service
 from pipeline.megakernel_tts_service import MegakernelTTSService
 from pipeline.metrics_observer import MetricsObserver
 
-SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 
 SYSTEM_PROMPT = """You are a helpful, concise voice assistant.
 Keep responses SHORT — 1-3 sentences maximum.
@@ -135,9 +135,17 @@ async def run_bot() -> None:
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(sample_rate=SAMPLE_RATE),
+            vad_analyzer=SileroVADAnalyzer(
+                sample_rate=16000,
+                params=VADParams(
+                    confidence=0.7,
+                    start_secs=0.2,
+                    stop_secs=0.2,
+                    min_volume=0.6,
+                ),
+            ),
             vad_audio_passthrough=True,
-            audio_in_sample_rate=SAMPLE_RATE,
+            audio_in_sample_rate=16000,
             audio_out_sample_rate=24000,
         ),
     )
@@ -185,7 +193,7 @@ async def run_bot() -> None:
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            audio_in_sample_rate=SAMPLE_RATE,
+            audio_in_sample_rate=16000,
             audio_out_sample_rate=24000,
             allow_interruptions=True,
         ),
