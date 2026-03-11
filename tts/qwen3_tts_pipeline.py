@@ -248,15 +248,33 @@ class Qwen3TTSPipeline:
           2. Megakernel decode in batches of CHUNK_TOKENS
           3. After each batch: call vocoder on cumulative tokens, yield new audio delta
 
-        chunk_callback receives raw int16 bytes for each audio chunk.
+        Audio is streamed via chunk_callback as it is produced.
+        The outer generate_custom_voice() vocoder call is intercepted and skipped
+        because we have already vocoded and streamed all audio internally.
         """
-        talker   = self._talker
-        inner_lm = self._qwen_model.model.talker
+        talker           = self._talker
+        inner_lm         = self._qwen_model.model.talker
         speech_tokenizer = self._qwen_model.model.speech_tokenizer
 
-        original_generate = inner_lm.generate
+        original_generate        = inner_lm.generate
+        original_decode          = speech_tokenizer.decode
         mk_stats: dict = {}
-        captured: dict = {}   # holds prefill output for inspection
+
+        # ------------------------------------------------------------------
+        # Patch speech_tokenizer.decode to be a no-op after streaming is done.
+        # The outer generate_custom_voice() calls decode() on the full token
+        # sequence AFTER _streaming_generate returns — we've already vocoded
+        # everything incrementally, so skip that redundant full-sequence call.
+        # We return a minimal valid response: one zero-sample waveform.
+        # ------------------------------------------------------------------
+        _decode_suppressed = [False]
+
+        def _noop_decode(codes_list, *args, **kwargs):
+            if _decode_suppressed[0]:
+                # Return zero-length audio so the outer code doesn't crash
+                dummy = np.zeros(0, dtype=np.float32)
+                return [dummy] * len(codes_list), TTS_SAMPLE_RATE
+            return original_decode(codes_list, *args, **kwargs)
 
         # ------------------------------------------------------------------
         # Patch inner_lm.generate to intercept the inputs_embeds + run
@@ -371,17 +389,21 @@ class Qwen3TTSPipeline:
             # Signal end-of-stream (empty bytes, is_final=True)
             chunk_callback(b"", True)
 
+            # Suppress the outer vocoder call that generate_custom_voice will
+            # make on the hidden_states we return — audio already streamed.
+            _decode_suppressed[0] = True
+
             return GenerateDecoderOnlyOutput(
                 sequences=torch.tensor([generated], dtype=torch.long, device=device),
                 hidden_states=tuple(fake_hidden_list),
             )
 
-        inner_lm.generate = _streaming_generate
+        inner_lm.generate         = _streaming_generate
+        speech_tokenizer.decode  = _noop_decode
         try:
-            # generate_custom_voice internally calls inner_lm.generate,
-            # which is now our _streaming_generate above.
-            # The wavs return value is discarded — audio was already streamed
-            # via chunk_callback inside _streaming_generate.
+            # generate_custom_voice internally calls inner_lm.generate
+            # (now _streaming_generate) which streams all audio via chunk_callback,
+            # then calls speech_tokenizer.decode (now _noop_decode) which is skipped.
             self._qwen_model.generate_custom_voice(
                 text=text,
                 language=self.language,
@@ -389,7 +411,8 @@ class Qwen3TTSPipeline:
                 max_new_tokens=self.max_new_tokens,
             )
         finally:
-            inner_lm.generate = original_generate
+            inner_lm.generate        = original_generate
+            speech_tokenizer.decode  = original_decode
 
         self.last_mk_stats = mk_stats
 
