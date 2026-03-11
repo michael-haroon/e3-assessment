@@ -41,7 +41,8 @@ def build_llm_service() -> LLMService:
             logger.info("LLM backend: Groq (llama-3.3-70b-versatile)")
             return GroqLLMService(
                 api_key=groq_key,
-                model="llama-3.3-70b-versatile",
+                settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
+
             )
         except Exception as exc:
             logger.warning(f"Groq init failed: {exc}")

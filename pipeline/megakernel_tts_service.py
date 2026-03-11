@@ -27,7 +27,8 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.tts_service import TTSService
+from pipecat.services.tts_service import TTSService, TTSSettings
+
 
 from tts.qwen3_tts_pipeline import Qwen3TTSPipeline, TTS_SAMPLE_RATE
 
@@ -46,7 +47,7 @@ class MegakernelTTSService(TTSService):
     def __init__(
         self,
         *,
-        voice: str = "Chelsie",
+        voice: str = "ryan",
         max_new_tokens: int = 1500,
         **kwargs,
     ):
@@ -59,7 +60,7 @@ class MegakernelTTSService(TTSService):
         )
 
         self._tts_pipeline = Qwen3TTSPipeline(
-            voice=voice,
+            speaker=voice,
             max_new_tokens=max_new_tokens,
             verbose=False,
         )

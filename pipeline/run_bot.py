@@ -35,7 +35,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import (
     OpenAILLMContext,
-    OpenAILLMContextAggregator,
+    OpenAILLMContextFrame,
 )
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
@@ -44,7 +44,7 @@ from pipeline.llm_fallback import build_llm_service
 from pipeline.megakernel_tts_service import MegakernelTTSService
 from pipeline.metrics_observer import MetricsObserver
 
-SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "24000"))
+SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
 
 SYSTEM_PROMPT = """You are a helpful, concise voice assistant.
 Keep responses SHORT — 1-3 sentences maximum.
@@ -135,10 +135,10 @@ async def run_bot() -> None:
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(sample_rate=SAMPLE_RATE),
             vad_audio_passthrough=True,
             audio_in_sample_rate=SAMPLE_RATE,
-            audio_out_sample_rate=SAMPLE_RATE,
+            audio_out_sample_rate=24000,
         ),
     )
 
@@ -159,7 +159,7 @@ async def run_bot() -> None:
 
     # ── TTS ───────────────────────────────────────────────────────────────────
     tts = MegakernelTTSService(
-        voice="Chelsie",
+        voice="ryan",
         max_new_tokens=int(os.getenv("TTS_MAX_TOKENS", "1500")),
     )
 
@@ -186,7 +186,7 @@ async def run_bot() -> None:
         pipeline,
         params=PipelineParams(
             audio_in_sample_rate=SAMPLE_RATE,
-            audio_out_sample_rate=SAMPLE_RATE,
+            audio_out_sample_rate=24000,
             allow_interruptions=True,
         ),
         observers=[metrics],

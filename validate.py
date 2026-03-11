@@ -117,6 +117,7 @@ async def test_full_tts(save_dir: str | None = None) -> bool:
         from tts.qwen3_tts_pipeline import Qwen3TTSPipeline, TTS_SAMPLE_RATE
 
         pipe = Qwen3TTSPipeline(verbose=False)
+        pipe._ensure_loaded()          # ← add this line
         text = "Hello, this is a streaming test of the Qwen3 TTS system."
 
         t0            = time.perf_counter()
@@ -177,6 +178,7 @@ async def test_streaming_is_realtime() -> bool:
         from tts.qwen3_tts_pipeline import Qwen3TTSPipeline, TTS_SAMPLE_RATE
 
         pipe = Qwen3TTSPipeline(verbose=False)
+        pipe._ensure_loaded()          # ← add this line
         text = "Streaming check. One two three four five."
 
         arrival_times = []

@@ -34,6 +34,7 @@ class MetricsObserver(BaseObserver):
     """
 
     def __init__(self, tts_service: MegakernelTTSService):
+        super().__init__(name="MetricsObserver")
         self._tts = tts_service
         self._utterance_start: Optional[float] = None  # when user stopped talking
         self._tts_started:     Optional[float] = None
