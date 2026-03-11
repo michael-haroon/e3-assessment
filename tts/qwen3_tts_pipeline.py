@@ -65,9 +65,11 @@ _CHUNK_SAMPLES = int(TTS_SAMPLE_RATE * 0.15)   # 3600 samples
 _CHUNK_BYTES   = _CHUNK_SAMPLES * 2             # int16 -> 7200 bytes
 
 _ADAPTIVE_MAX_NEW_TOKENS = os.getenv("TTS_ADAPTIVE_MAX_NEW_TOKENS", "1") != "0"
-_MIN_NEW_TOKENS = int(os.getenv("TTS_MIN_NEW_TOKENS", "120"))
-_TOKENS_PER_CHAR = float(os.getenv("TTS_TOKENS_PER_CHAR", "4.0"))
-_SENTENCE_BONUS = int(os.getenv("TTS_SENTENCE_TOKEN_BONUS", "48"))
+_MIN_NEW_TOKENS = int(os.getenv("TTS_MIN_NEW_TOKENS", "96"))
+_TOKENS_PER_CHAR = float(os.getenv("TTS_TOKENS_PER_CHAR", "2.6"))
+_SENTENCE_BONUS = int(os.getenv("TTS_SENTENCE_TOKEN_BONUS", "24"))
+_SHORT_TEXT_CHARS = int(os.getenv("TTS_SHORT_TEXT_CHARS", "80"))
+_SHORT_TEXT_MAX_NEW_TOKENS = int(os.getenv("TTS_SHORT_TEXT_MAX_NEW_TOKENS", "180"))
 
 class Qwen3TTSPipeline:
     """
@@ -175,14 +177,19 @@ class Qwen3TTSPipeline:
 
 
     def _estimate_max_new_tokens(self, text: str) -> int:
-        """Estimate a per-request token budget to reduce over-generation latency."""
+        """Estimate per-request token budget tuned for lower conversational latency."""
         if not _ADAPTIVE_MAX_NEW_TOKENS:
             return self.max_new_tokens
 
-        n_chars = len(text.strip())
+        stripped = text.strip()
+        n_chars = len(stripped)
         est = int(max(_MIN_NEW_TOKENS, n_chars * _TOKENS_PER_CHAR))
-        if text.strip().endswith((".", "!", "?")):
+        if stripped.endswith((".", "!", "?")):
             est += _SENTENCE_BONUS
+
+        if n_chars <= _SHORT_TEXT_CHARS:
+            est = min(est, _SHORT_TEXT_MAX_NEW_TOKENS)
+
         return max(1, min(est, self.max_new_tokens))
 
     def _synthesize_with_megakernel(self, text: str, max_new_tokens: int) -> np.ndarray:
