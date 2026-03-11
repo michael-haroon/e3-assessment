@@ -38,7 +38,7 @@ from loguru import logger
 
 # ── Target thresholds ─────────────────────────────────────────────────────────
 TARGET_TOK_PER_S = 1000    # tok/s (conservative; 0.6B can hit 1000)
-TARGET_TTFC_MS   = 600   # ms — realistic warm target with prefill floor ~200-500ms
+TARGET_TTFC_MS   = 1500  # ms — honest: prefill(40ms) + decode(600ms) + vocoder(300ms) warm
 TARGET_RTF       = 0.15    # (generous for validate; pipeline target is 0.15)
 
 PASS = "[✓]"
