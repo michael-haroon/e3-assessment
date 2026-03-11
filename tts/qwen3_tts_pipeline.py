@@ -304,8 +304,6 @@ class Qwen3TTSPipeline:
             logger.info(f"Prefill: {prefill_ms:.0f}ms")
 
             first_token = int(out.sequences[0, -1].item())
-            captured["first_token"] = first_token
-            captured["device"]      = inputs_embeds.device
 
             if first_token in eos_set:
                 return out
