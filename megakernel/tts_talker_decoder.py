@@ -363,6 +363,14 @@ class TTSTalkerDecoder:
     def tokenizer(self):
         return self._tokenizer
 
+    @property
+    def codec_vocab_size(self) -> int:
+        return CODEC_VOCAB_SIZE
+
+    @property
+    def max_seq_len(self) -> int:
+        return self._max_seq_len
+
     def step(self, token_id: int) -> int:
         """
         Run one decode step through the megakernel.
@@ -372,6 +380,15 @@ class TTSTalkerDecoder:
         Returns:
             next token id (argmax)
         """
+        if token_id < 0 or token_id >= CODEC_VOCAB_SIZE:
+            raise ValueError(
+                f"Codec token id out of range: {token_id} (expected 0..{CODEC_VOCAB_SIZE-1})"
+            )
+        if self._position >= self._max_seq_len:
+            raise RuntimeError(
+                f"Megakernel sequence length exceeded: pos={self._position}, max={self._max_seq_len}"
+            )
+
         self._decode_op(
             self._out_token,
             token_id,
@@ -400,7 +417,12 @@ class TTSTalkerDecoder:
             self._attn_scale,
         )
         self._position += 1
-        return int(self._out_token.item())
+        next_token = int(self._out_token.item())
+        if next_token < 0 or next_token >= CODEC_VOCAB_SIZE:
+            raise RuntimeError(
+                f"Megakernel produced invalid token id {next_token} at position {self._position}"
+            )
+        return next_token
 
     def prefill(self, token_ids: list[int]) -> None:
         """
