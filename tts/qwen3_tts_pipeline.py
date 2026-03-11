@@ -64,7 +64,7 @@ TTS_CHANNELS    = 1
 _CHUNK_SAMPLES = int(TTS_SAMPLE_RATE * 0.15)   # 3600 samples
 _CHUNK_BYTES   = _CHUNK_SAMPLES * 2             # int16 -> 7200 bytes
 
-_ADAPTIVE_MAX_NEW_TOKENS = os.getenv("TTS_ADAPTIVE_MAX_NEW_TOKENS", "1") != "0"
+_ADAPTIVE_MAX_NEW_TOKENS = os.getenv("TTS_ADAPTIVE_MAX_NEW_TOKENS", "0") != "0"
 _MIN_NEW_TOKENS = int(os.getenv("TTS_MIN_NEW_TOKENS", "96"))
 _TOKENS_PER_CHAR = float(os.getenv("TTS_TOKENS_PER_CHAR", "2.6"))
 _SENTENCE_BONUS = int(os.getenv("TTS_SENTENCE_TOKEN_BONUS", "24"))
@@ -97,6 +97,7 @@ class Qwen3TTSPipeline:
         self._qwen_model = None   # Qwen3TTSModel
         self._talker     = None   # TTSTalkerDecoder (megakernel)
         self._loaded     = False
+        self._cuda_poisoned = False
 
         if verbose:
             logger.info("Qwen3TTSPipeline created -- weights load on first call")
@@ -142,6 +143,9 @@ class Qwen3TTSPipeline:
         Async generator: text -> int16 PCM bytes chunks (24 kHz, mono).
         Runs blocking synthesis in executor, then chunks and yields.
         """
+        if self._cuda_poisoned:
+            raise RuntimeError("TTS CUDA context is in a failed state; restart the worker process")
+
         self._ensure_loaded()
 
         loop = asyncio.get_event_loop()
@@ -165,12 +169,31 @@ class Qwen3TTSPipeline:
             yield audio_bytes[offset : offset + _CHUNK_BYTES]
             await asyncio.sleep(0)
 
+    @staticmethod
+    def _is_fatal_cuda_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return "cuda" in msg and (
+            "illegal memory access" in msg
+            or "device-side assert" in msg
+            or "device kernel image is invalid" in msg
+        )
+
+    def _handle_fatal_cuda_error(self, exc: Exception) -> None:
+        self._cuda_poisoned = True
+        logger.error(
+            "Fatal CUDA error in TTS decode; skipping fallback because CUDA context is likely poisoned. "
+            "Please restart the worker process."
+        )
+
     def _synthesize_blocking(self, text: str, max_new_tokens: int) -> tuple:
         """Blocking synthesis -- runs in thread-pool executor."""
         t0 = time.perf_counter()
         try:
             audio = self._synthesize_with_megakernel(text, max_new_tokens)
         except Exception as e:
+            if self._is_fatal_cuda_error(e):
+                self._handle_fatal_cuda_error(e)
+                raise
             logger.warning(f"Megakernel failed ({e!r}) -- falling back to native generate")
             audio = self._synthesize_fallback(text, max_new_tokens)
         return audio, time.perf_counter() - t0
