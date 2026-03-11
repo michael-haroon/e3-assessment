@@ -24,6 +24,9 @@ import time
 # Make sure the project root is on the path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Must be first — shims flash_attn_3 as flash_attn before any qwen_tts import
+import bootstrap  # noqa: F401
+
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
@@ -166,10 +169,25 @@ async def run_bot() -> None:
     llm = build_llm_service()
 
     # ── TTS ───────────────────────────────────────────────────────────────────
+    # max_new_tokens=40 ≈ 3.3s audio at 12 Hz codec rate.
+    # EOS detection is currently broken (KV cache reset after prefill), so the
+    # model always generates to the cap. 40 tokens keeps utterances short enough
+    # to sound intelligible without excessive hiss/padding at the tail.
     tts = MegakernelTTSService(
         voice="ryan",
-        max_new_tokens=150,
+        max_new_tokens=40,
     )
+
+    # ── Pre-warm TTS model ────────────────────────────────────────────────────
+    # Load the Qwen3-TTS model + megakernel NOW, before the pipeline starts.
+    # This avoids a ~23s stall on the first TTS call which would:
+    #   - Cause Deepgram to time out (net0001 error) because no audio flows
+    #   - Make TTFC for the greeting appear to be ~26000ms
+    logger.info("Pre-warming TTS model (this takes ~25s on first run)...")
+    await asyncio.get_event_loop().run_in_executor(
+        None, tts._tts_pipeline._ensure_loaded
+    )
+    logger.info("TTS model ready.")
 
     # ── Context / aggregators ─────────────────────────────────────────────────
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]

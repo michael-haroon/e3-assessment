@@ -39,19 +39,8 @@ import numpy as np
 import torch
 from loguru import logger
 
-# ── flash_attn shim ───────────────────────────────────────────────────────────
-# qwen_tts checks `import flash_attn` at import time and warns if it's missing.
-# flash_attn_3 exposes the same public API under a different package name.
-# Register it under the expected name so the warning is suppressed.
-if "flash_attn" not in sys.modules:
-    try:
-        import flash_attn_3 as _fa3
-        sys.modules["flash_attn"] = _fa3
-        # Also cover the sub-module the warning check typically probes
-        import flash_attn_3.flash_attn_interface as _fa3_iface  # noqa: F401
-        sys.modules["flash_attn.flash_attn_interface"] = _fa3_iface
-    except ImportError:
-        pass  # neither package present — let qwen_tts warn as normal
+# ── flash_attn shim — must run before any qwen_tts import ───────────────────
+import bootstrap  # noqa: F401  (side-effect import: registers flash_attn_3 as flash_attn)
 
 TTS_SAMPLE_RATE = 24_000
 TTS_CHANNELS    = 1

@@ -29,6 +29,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Must be first — shims flash_attn_3 as flash_attn before any qwen_tts import
+import bootstrap  # noqa: F401
+
 from dotenv import load_dotenv
 load_dotenv(".env")
 
