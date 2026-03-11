@@ -168,7 +168,7 @@ async def run_bot() -> None:
     # ── TTS ───────────────────────────────────────────────────────────────────
     tts = MegakernelTTSService(
         voice="ryan",
-        max_new_tokens=int(os.getenv("TTS_MAX_TOKENS", "1500")),
+        max_new_tokens=150,
     )
 
     # ── Context / aggregators ─────────────────────────────────────────────────
