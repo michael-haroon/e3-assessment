@@ -1,7 +1,52 @@
-# e3-assessment — RTX 5090 Megakernel → Qwen3-TTS on Pipecat
+# e3-assessment — Baseline vs Megakernel Qwen3-TTS on Pipecat
+
+This repo now supports two side-by-side tracks:
+
+1. **Baseline pipeline (reference / known-good)**
+   - Uses standard prebuilt components only.
+   - Qwen3-TTS runs with native PyTorch generation.
+2. **Modified pipeline (experimental)**
+   - Same voice stack, but replaces the talker decode loop with the CUDA megakernel.
+
+The point of maintaining both is parity verification: the baseline is the oracle, and
+the modified path must match it token-by-token in deterministic mode.
 
 A voice agent pipeline that wires **AlpinDale's CUDA megakernel** into **Qwen3-TTS** and streams
 audio in real-time through a **Pipecat + Daily WebRTC** pipeline.
+
+---
+
+## Pipeline modes
+
+| Mode | STT | LLM | TTS Talker Decode | Vocoder |
+|------|-----|-----|-------------------|---------|
+| Baseline | Deepgram | Groq→OR→Gemini | Native PyTorch | CosyVoice |
+| Modified | Deepgram | Groq→OR→Gemini | Megakernel decode loop | CosyVoice |
+
+Both modes should produce identical deterministic token decode for the compared stage.
+Any divergence indicates a bug in KV handoff, positional indexing (RoPE), or decode-state wiring.
+
+---
+
+## Parity test (must pass)
+
+Run the deterministic parity harness:
+
+```bash
+python benchmarks/parity_test.py --prompt "Hello" --steps 10 --seed 1234
+```
+
+What it does:
+
+1. Fixed seed + deterministic decode settings.
+2. Runs 10 talker decode steps with standard PyTorch and stores token IDs.
+3. Runs 10 talker decode steps with megakernel and stores token IDs.
+4. Compares token IDs step-by-step.
+
+Expected result:
+
+- **All token IDs are identical at each step.**
+- On mismatch, treat as integration bug (KV cache handoff, RoPE/position, or decode state).
 
 ```
 Mic (browser)

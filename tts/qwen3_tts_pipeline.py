@@ -124,6 +124,7 @@ class Qwen3TTSPipeline:
         # Clamp to the hard cap so callers can't accidentally pass 1500 again
         self.max_new_tokens = min(max_new_tokens, _MAX_TOKENS_HARD_CAP)
         self.last_mk_stats: dict = {}
+        self._generation_kwargs: dict = {}
 
         self._qwen_model = None
         self._talker     = None
@@ -449,6 +450,7 @@ class Qwen3TTSPipeline:
                 elapsed   = elapsed,
                 tok_per_s = len(generated) / elapsed if elapsed > 0 else 0,
                 hit_eos   = (eos_set and generated[-1] in eos_set),
+                generated_tokens=list(generated),
             )
             logger.info(
                 f"Megakernel: {len(generated)} tok in {elapsed*1000:.1f}ms "
@@ -470,6 +472,7 @@ class Qwen3TTSPipeline:
                 language       = self.language,
                 speaker        = self.speaker,
                 max_new_tokens = self.max_new_tokens,
+                **self._generation_kwargs,
             )
         finally:
             inner_lm.generate = original_generate
@@ -494,6 +497,7 @@ class Qwen3TTSPipeline:
             language       = self.language,
             speaker        = self.speaker,
             max_new_tokens = self.max_new_tokens,
+            **self._generation_kwargs,
         )
         self.last_mk_stats = {"fallback": True}
         audio = wavs[0]
