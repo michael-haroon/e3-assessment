@@ -86,6 +86,17 @@ def _normalize_predictor_hidden(hidden: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected hidden rank in (1,2,3), got shape={tuple(hidden.shape)}")
 
 
+def _build_predictor_generate_kwargs(kwargs: dict) -> dict:
+    """Extract code_predictor.generate() kwargs from talker.generate() kwargs."""
+    return {
+        "do_sample": kwargs.get("subtalker_dosample", False),
+        "top_p": kwargs.get("subtalker_top_p", 1.0),
+        "top_k": kwargs.get("subtalker_top_k", 0),
+        "temperature": kwargs.get("subtalker_temperature", 1.0),
+        "return_dict_in_generate": True,
+    }
+
+
 class Qwen3TTSPipeline:
     """
     Qwen3-TTS-12Hz-0.6B-CustomVoice with megakernel LM backend.
@@ -204,6 +215,7 @@ class Qwen3TTSPipeline:
 
         original_generate = inner_lm.generate
         mk_stats: dict = {}
+        predictor_generate_kwargs: dict = {}
 
         def _copy_prefill_kv_to_talker(prefill_out) -> dict:
             """Copy HF prefill cache into megakernel flat KV buffers."""
@@ -294,11 +306,7 @@ class Qwen3TTSPipeline:
                     predictor_result = code_predictor.generate(
                         inputs_embeds=predictor_inputs,
                         max_new_tokens=num_groups - 1,
-                        do_sample=kwargs.get("subtalker_dosample", False),
-                        top_p=kwargs.get("subtalker_top_p", 1.0),
-                        top_k=kwargs.get("subtalker_top_k", 0),
-                        temperature=kwargs.get("subtalker_temperature", 1.0),
-                        return_dict_in_generate=True,
+                        **predictor_generate_kwargs,
                     )
 
                     residual = predictor_result.sequences
@@ -334,6 +342,8 @@ class Qwen3TTSPipeline:
             elif isinstance(raw_eos, torch.Tensor):
                 raw_eos = raw_eos.tolist()
             eos_set = set(int(x) for x in raw_eos if x is not None)
+            predictor_generate_kwargs.clear()
+            predictor_generate_kwargs.update(_build_predictor_generate_kwargs(kwargs))
 
             # ── Step 1: PyTorch prefill (one token) ───────────────────────────
             prefill_kwargs, removed_prefill = _sanitize_prefill_kwargs(kwargs)

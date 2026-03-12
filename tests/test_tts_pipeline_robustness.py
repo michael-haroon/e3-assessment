@@ -1,11 +1,16 @@
 import pytest
-import torch
 import pathlib
 import sys
 
+torch = pytest.importorskip("torch")
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from tts.qwen3_tts_pipeline import _normalize_predictor_hidden, _sanitize_prefill_kwargs
+from tts.qwen3_tts_pipeline import (
+    _build_predictor_generate_kwargs,
+    _normalize_predictor_hidden,
+    _sanitize_prefill_kwargs,
+)
 
 
 def test_sanitize_prefill_kwargs_removes_conflicting_keys():
@@ -53,3 +58,20 @@ def test_normalize_predictor_hidden_invalid_rank2_batch():
 def test_normalize_predictor_hidden_invalid_rank4():
     with pytest.raises(ValueError):
         _normalize_predictor_hidden(torch.randn(1, 1, 1, 1024))
+
+
+def test_build_predictor_generate_kwargs_from_subtalker_args():
+    kwargs = {
+        "subtalker_dosample": True,
+        "subtalker_top_p": 0.85,
+        "subtalker_top_k": 12,
+        "subtalker_temperature": 0.65,
+    }
+    got = _build_predictor_generate_kwargs(kwargs)
+    assert got == {
+        "do_sample": True,
+        "top_p": 0.85,
+        "top_k": 12,
+        "temperature": 0.65,
+        "return_dict_in_generate": True,
+    }
