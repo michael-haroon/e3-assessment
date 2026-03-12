@@ -55,6 +55,37 @@ _MAX_TOKENS_HARD_CAP = 300
 _DEFAULT_MAX_NEW_TOKENS = 40
 
 
+def _sanitize_prefill_kwargs(kwargs: dict) -> tuple[dict, dict]:
+    """Remove args that the wrapper controls for the prefill call."""
+    prefill_kwargs = dict(kwargs)
+    removed = {}
+    for key in (
+        "max_new_tokens",
+        "min_new_tokens",
+        "eos_token_id",
+        "return_dict_in_generate",
+        "use_cache",
+    ):
+        if key in prefill_kwargs:
+            removed[key] = prefill_kwargs.pop(key)
+    return prefill_kwargs, removed
+
+
+def _normalize_predictor_hidden(hidden: torch.Tensor) -> torch.Tensor:
+    """Normalize megakernel hidden state to predictor shape [B, T, H]."""
+    if hidden.dim() == 1:
+        return hidden.view(1, 1, -1)
+    if hidden.dim() == 2:
+        if hidden.shape[0] != 1:
+            raise ValueError(f"Expected hidden shape [1, H] for rank-2, got {tuple(hidden.shape)}")
+        return hidden.unsqueeze(1)
+    if hidden.dim() == 3:
+        if hidden.shape[0] != 1:
+            raise ValueError(f"Expected hidden batch=1 for rank-3, got {tuple(hidden.shape)}")
+        return hidden
+    raise ValueError(f"Expected hidden rank in (1,2,3), got shape={tuple(hidden.shape)}")
+
+
 class Qwen3TTSPipeline:
     """
     Qwen3-TTS-12Hz-0.6B-CustomVoice with megakernel LM backend.
@@ -174,11 +205,11 @@ class Qwen3TTSPipeline:
         original_generate = inner_lm.generate
         mk_stats: dict = {}
 
-        def _copy_prefill_kv_to_talker(prefill_out) -> int:
+        def _copy_prefill_kv_to_talker(prefill_out) -> dict:
             """Copy HF prefill cache into megakernel flat KV buffers."""
             pkv = getattr(prefill_out, "past_key_values", None)
             if pkv is None:
-                return 0
+                return {"ok": False, "reason": "missing past_key_values", "seq_len": 0, "layers_copied": 0}
 
             # HF can return either a DynamicCache-like object or a tuple/list.
             if hasattr(pkv, "to_legacy_cache"):
@@ -187,10 +218,12 @@ class Qwen3TTSPipeline:
                 pkv = list(zip(pkv.key_cache, pkv.value_cache))
 
             if not isinstance(pkv, (list, tuple)):
-                return 0
+                return {"ok": False, "reason": f"unexpected pkv type={type(pkv).__name__}", "seq_len": 0, "layers_copied": 0}
 
             seq_len = 0
-            n_layers = min(len(pkv), talker._k_cache.shape[0])
+            layers_copied = 0
+            n_expected_layers = int(talker._k_cache.shape[0])
+            n_layers = min(len(pkv), n_expected_layers)
             for layer_idx in range(n_layers):
                 layer = pkv[layer_idx]
                 if not isinstance(layer, (list, tuple)) or len(layer) < 2:
@@ -211,9 +244,19 @@ class Qwen3TTSPipeline:
                 talker._k_cache[layer_idx, :h, :t, :d].copy_(k[0, :h, :t, :d])
                 talker._v_cache[layer_idx, :h, :t, :d].copy_(v[0, :h, :t, :d])
                 seq_len = max(seq_len, t)
+                layers_copied += 1
 
             talker._position = seq_len
-            return seq_len
+            ok = seq_len > 0 and layers_copied >= max(1, int(0.8 * n_expected_layers))
+            reason = "ok" if ok else (
+                f"insufficient cache copy: seq_len={seq_len} layers_copied={layers_copied}/{n_expected_layers}"
+            )
+            return {
+                "ok": ok,
+                "reason": reason,
+                "seq_len": seq_len,
+                "layers_copied": layers_copied,
+            }
 
         def _predict_residual_codebooks(first_codebook_token: int, hidden_1024: torch.Tensor) -> torch.Tensor:
             """Predict codebooks 2..16 using the talker code_predictor path."""
@@ -225,27 +268,50 @@ class Qwen3TTSPipeline:
             if code_predictor is None:
                 return codec_ids
 
-            with torch.no_grad():
-                input_ids = torch.tensor([[int(first_codebook_token)]], dtype=torch.long, device=hidden_1024.device)
-                last_id_hidden = inner_lm.get_input_embeddings()(input_ids)
-                predictor_inputs = torch.cat((hidden_1024.unsqueeze(1), last_id_hidden), dim=1)
+            try:
+                with torch.no_grad():
+                    past_hidden = _normalize_predictor_hidden(hidden_1024)
+                    input_ids = torch.tensor([[int(first_codebook_token)]], dtype=torch.long, device=hidden_1024.device)
+                    last_id_hidden = inner_lm.get_input_embeddings()(input_ids)
 
-                predictor_result = code_predictor.generate(
-                    inputs_embeds=predictor_inputs,
-                    max_new_tokens=num_groups - 1,
-                    do_sample=kwargs.get("subtalker_dosample", False),
-                    top_p=kwargs.get("subtalker_top_p", 1.0),
-                    top_k=kwargs.get("subtalker_top_k", 0),
-                    temperature=kwargs.get("subtalker_temperature", 1.0),
-                    return_dict_in_generate=True,
+                    if past_hidden.dim() != 3 or last_id_hidden.dim() != 3:
+                        raise ValueError(
+                            f"predictor input rank mismatch: past_hidden={tuple(past_hidden.shape)} "
+                            f"last_id_hidden={tuple(last_id_hidden.shape)}"
+                        )
+                    if past_hidden.shape[0] != last_id_hidden.shape[0] or past_hidden.shape[2] != last_id_hidden.shape[2]:
+                        raise ValueError(
+                            f"predictor shape mismatch: past_hidden={tuple(past_hidden.shape)} "
+                            f"last_id_hidden={tuple(last_id_hidden.shape)}"
+                        )
+
+                    logger.debug(
+                        "Megakernel predictor inputs: "
+                        f"past_hidden={tuple(past_hidden.shape)} last_id_hidden={tuple(last_id_hidden.shape)}"
+                    )
+                    predictor_inputs = torch.cat((past_hidden, last_id_hidden), dim=1)
+
+                    predictor_result = code_predictor.generate(
+                        inputs_embeds=predictor_inputs,
+                        max_new_tokens=num_groups - 1,
+                        do_sample=kwargs.get("subtalker_dosample", False),
+                        top_p=kwargs.get("subtalker_top_p", 1.0),
+                        top_k=kwargs.get("subtalker_top_k", 0),
+                        temperature=kwargs.get("subtalker_temperature", 1.0),
+                        return_dict_in_generate=True,
+                    )
+
+                    residual = predictor_result.sequences
+                    if residual.dim() != 2:
+                        raise ValueError(f"Unexpected predictor sequences shape={tuple(residual.shape)}")
+                    if residual.shape[-1] > (num_groups - 1):
+                        residual = residual[..., -(num_groups - 1):]
+                    residual = residual.to(device=hidden_1024.device, dtype=torch.long)
+                    codec_ids[0, 1 : 1 + residual.shape[-1]] = residual[0]
+            except Exception as exc:
+                logger.warning(
+                    f"Megakernel predictor failed ({exc!r}) — using first codebook only for this step"
                 )
-
-                # `sequences` may include prompt tokens depending on generate impl.
-                residual = predictor_result.sequences
-                if residual.shape[-1] > (num_groups - 1):
-                    residual = residual[..., -(num_groups - 1):]
-                residual = residual.to(device=hidden_1024.device, dtype=torch.long)
-                codec_ids[0, 1 : 1 + residual.shape[-1]] = residual[0]
 
             return codec_ids
 
@@ -270,6 +336,13 @@ class Qwen3TTSPipeline:
             eos_set = set(int(x) for x in raw_eos if x is not None)
 
             # ── Step 1: PyTorch prefill (one token) ───────────────────────────
+            prefill_kwargs, removed_prefill = _sanitize_prefill_kwargs(kwargs)
+            if removed_prefill:
+                logger.debug(
+                    "Megakernel prefill overrides caller kwargs: "
+                    + ", ".join(f"{k}={v!r}" for k, v in removed_prefill.items())
+                )
+
             with torch.no_grad():
                 out = original_generate(
                     inputs_embeds=inputs_embeds,
@@ -278,9 +351,7 @@ class Qwen3TTSPipeline:
                     min_new_tokens=1,
                     return_dict_in_generate=True,
                     use_cache=True,
-                    **{k: v for k, v in kwargs.items()
-                       if k not in ("max_new_tokens", "min_new_tokens",
-                                    "eos_token_id")}
+                    **prefill_kwargs,
                 )
 
             first_token = int(out.sequences[0, -1].item())
@@ -293,9 +364,13 @@ class Qwen3TTSPipeline:
             # ── Step 2: megakernel decode loop ────────────────────────────────
             device = inputs_embeds.device
             talker.reset()
-            prefill_seq_len = _copy_prefill_kv_to_talker(out)
-            if prefill_seq_len > 0:
-                logger.debug(f"Megakernel: imported prefill KV cache (seq_len={prefill_seq_len})")
+            handoff = _copy_prefill_kv_to_talker(out)
+            if not handoff["ok"]:
+                raise RuntimeError(f"Megakernel KV handoff failed: {handoff['reason']}")
+            logger.debug(
+                "Megakernel: imported prefill KV cache "
+                f"(seq_len={handoff['seq_len']}, layers={handoff['layers_copied']})"
+            )
             generated    = [first_token]
             fake_hiddens = []
             t0           = time.perf_counter()
@@ -313,7 +388,7 @@ class Qwen3TTSPipeline:
                 )
                 codec_ids = _predict_residual_codebooks(
                     first_codebook_token=tok,
-                    hidden_1024=talker._hidden,
+                    hidden_1024=layer_hidden,
                 )
                 fake_hiddens.append(((layer_hidden,), codec_ids))
 
