@@ -242,6 +242,9 @@ class Qwen3TTSPipeline:
             layers_copied = 0
             n_expected_layers = int(talker._k_cache.shape[0])
             n_layers = min(len(pkv), n_expected_layers)
+            # Debug: what's actually in the cache?
+            k0 = pkv[0][0]
+            logger.info(f"DEBUG KV cache: pkv[0][0].shape={tuple(k0.shape)} n_layers={len(pkv)}")
             for layer_idx in range(n_layers):
                 layer = pkv[layer_idx]
                 if not isinstance(layer, (list, tuple)) or len(layer) < 2:
@@ -409,6 +412,7 @@ class Qwen3TTSPipeline:
             device = inputs_embeds.device
             talker.reset()
             handoff = _copy_prefill_kv_to_talker(out)
+            logger.info(f"DEBUG handoff seq_len={handoff['seq_len']} out.sequences shape={out.sequences.shape} out.sequences[0]={out.sequences[0].tolist()}")
             if not handoff["ok"]:
                 raise RuntimeError(f"Megakernel KV handoff failed: {handoff['reason']}")
             logger.debug(

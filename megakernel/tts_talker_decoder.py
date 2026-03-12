@@ -12,11 +12,11 @@ num_q_heads         16           16                 identical
 num_kv_heads        8            8                  identical
 head_dim            128          128                identical
 intermediate_size   3072         3072               identical
-num_hidden_layers   28           20                 runtime param → no recompile
+num_hidden_layers   28           28                 runtime param → no recompile
 vocab_size          151936       151936             shared Qwen tokenizer
 
 Because every compile-time constant is identical, we compile the kernel once
-and simply pass `num_layers=20` at decode time instead of 28.
+and simply pass `num_layers=28`.
 
 Weight layout expected from Qwen3-TTS HF model (confirmed via state dict)
 ───────────────────────────────────────────────────────────────────────────
@@ -25,7 +25,7 @@ The model is NOT a standard Qwen3ForCausalLM. It is a two-vocabulary model:
   talker.model.text_embedding   (151936, 2048)  text token embedding (2048-dim)
   talker.text_projection.*                      2048 → 1024 projection
   talker.model.codec_embedding  (3072, 1024)    codec token embedding (1024-dim)
-  talker.model.layers.X.*                       shared 20-layer transformer
+  talker.model.layers.X.*                       shared 28-layer transformer
   talker.model.norm.weight      (1024,)         final RMS norm
   talker.codec_head.weight      (3072, 1024)    codec output head
   talker.code_predictor.*                       multi-codebook predictor (15 books)
@@ -33,7 +33,7 @@ The model is NOT a standard Qwen3ForCausalLM. It is a two-vocabulary model:
 The megakernel handles ONLY the codec autoregressive decode:
   input:  codec token id  (0..3071)
   embed:  talker.model.codec_embedding.weight  row lookup → 1024-dim vector
-  decode: 20 transformer layers
+  decode: 28 transformer layers
   output: talker.codec_head.weight @ hidden    → argmax over 3072 classes
 
 The text conditioning path (text_embedding → text_projection → transformer)
@@ -61,7 +61,7 @@ import torch
 from loguru import logger
 
 # ── Architecture constants (talker backbone) ─────────────────────────────────
-NUM_LAYERS        = 20          # Qwen3-TTS talker: 20, not 28
+NUM_LAYERS        = 28          
 NUM_KV_HEADS      = 8
 HEAD_DIM          = 128
 HIDDEN_SIZE       = 1024
@@ -84,8 +84,9 @@ MAX_SEQ_LEN       = 4096   # Generous for TTS utterances (~1500 codec tokens)
 # ── Helper: build RoPE tables ─────────────────────────────────────────────────
 
 def _build_rope_tables(max_seq_len: int = MAX_SEQ_LEN) -> tuple[torch.Tensor, torch.Tensor]:
+    theta = 1_000_000.0  # Qwen3 uses 1M, not 10000
     inv_freq = 1.0 / (
-        10000.0 ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
+        theta ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
     )
     positions = torch.arange(max_seq_len, dtype=torch.float32)
     freqs = torch.outer(positions, inv_freq)
@@ -364,14 +365,6 @@ class TTSTalkerDecoder:
         return self._tokenizer
 
     def step(self, token_id: int) -> int:
-        """
-        Run one decode step through the megakernel.
-
-        Args:
-            token_id: current input token id
-        Returns:
-            next token id (argmax)
-        """
         self._decode_op(
             self._out_token,
             token_id,
@@ -394,13 +387,16 @@ class TTSTalkerDecoder:
             self._norm_out,
             self._bmax_vals,
             self._bmax_idxs,
-            NUM_LAYERS,            # ← 20 for TTS talker, not 28
+            NUM_LAYERS,
             self._position,
             self._max_seq_len,
             self._attn_scale,
         )
         self._position += 1
-        return int(self._out_token.item())
+        # Bypass kernel LM head — recompute argmax from _norm_out in Python
+        # (kernel LM head has a correctness bug; transformer body is correct)
+        tok = int((self._norm_out @ self._lm_head_weight.float().T).argmax().item())
+        return tok
 
     def prefill(self, token_ids: list[int]) -> None:
         """
