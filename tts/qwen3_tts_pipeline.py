@@ -93,6 +93,11 @@ def _build_predictor_generate_kwargs(kwargs: dict) -> dict:
         "top_p": kwargs.get("subtalker_top_p", 1.0),
         "top_k": kwargs.get("subtalker_top_k", 0),
         "temperature": kwargs.get("subtalker_temperature", 1.0),
+        # Must match the native forward() path which passes both of these.
+        # output_hidden_states=True is required for the code_predictor's
+        # _update_model_kwargs_for_generation to propagate generation_steps,
+        # which selects the correct per-codebook embedding table and lm_head.
+        "output_hidden_states": True,
         "return_dict_in_generate": True,
     }
 
@@ -270,6 +275,14 @@ class Qwen3TTSPipeline:
                 "layers_copied": layers_copied,
             }
 
+        # ── Grab the talker's final RMS norm so we can apply it to the
+        #    megakernel's raw hidden state.  The megakernel _hidden buffer is
+        #    the *pre-norm* residual stream output.  The native forward()
+        #    path feeds code_predictor the *post-norm* hidden (i.e. after
+        #    model.norm()).  Without this, codebooks 1-15 are conditioned on
+        #    the wrong representation and the vocoder produces garbled audio.
+        _talker_final_norm = inner_lm.model.norm
+
         def _predict_residual_codebooks(first_codebook_token: int, hidden_1024: torch.Tensor) -> torch.Tensor:
             """Predict codebooks 2..16 using the talker code_predictor path."""
             num_groups = int(getattr(inner_lm.config, "num_code_groups", 16))
@@ -282,7 +295,13 @@ class Qwen3TTSPipeline:
 
             try:
                 with torch.no_grad():
-                    past_hidden = _normalize_predictor_hidden(hidden_1024)
+                    # Apply the talker's final RMS norm to match the native
+                    # forward() path — this is the critical fix for garbled
+                    # audio.  _hidden from the megakernel is pre-norm; the
+                    # code_predictor expects post-norm.
+                    past_hidden = _normalize_predictor_hidden(
+                        _talker_final_norm(hidden_1024)
+                    )
                     input_ids = torch.tensor([[int(first_codebook_token)]], dtype=torch.long, device=hidden_1024.device)
                     last_id_hidden = inner_lm.get_input_embeddings()(input_ids)
                     # Keep predictor inputs on the embedding dtype (typically bf16)
