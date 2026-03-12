@@ -285,6 +285,12 @@ class Qwen3TTSPipeline:
                     past_hidden = _normalize_predictor_hidden(hidden_1024)
                     input_ids = torch.tensor([[int(first_codebook_token)]], dtype=torch.long, device=hidden_1024.device)
                     last_id_hidden = inner_lm.get_input_embeddings()(input_ids)
+                    # Keep predictor inputs on the embedding dtype (typically bf16)
+                    # to avoid matmul dtype mismatches inside code_predictor.
+                    past_hidden = past_hidden.to(
+                        device=last_id_hidden.device,
+                        dtype=last_id_hidden.dtype,
+                    )
 
                     if past_hidden.dim() != 3 or last_id_hidden.dim() != 3:
                         raise ValueError(
@@ -299,7 +305,8 @@ class Qwen3TTSPipeline:
 
                     logger.debug(
                         "Megakernel predictor inputs: "
-                        f"past_hidden={tuple(past_hidden.shape)} last_id_hidden={tuple(last_id_hidden.shape)}"
+                        f"past_hidden={tuple(past_hidden.shape)}:{past_hidden.dtype} "
+                        f"last_id_hidden={tuple(last_id_hidden.shape)}:{last_id_hidden.dtype}"
                     )
                     predictor_inputs = torch.cat((past_hidden, last_id_hidden), dim=1)
 
@@ -391,7 +398,7 @@ class Qwen3TTSPipeline:
                 tok = talker.step(token_id)
 
                 layer_hidden = (
-                    talker._hidden.float()
+                    talker._hidden
                     .unsqueeze(0)
                     .unsqueeze(0)
                     .clone()   # (1, 1, 1024)
