@@ -392,10 +392,17 @@ class Qwen3TTSPipeline:
 
             first_token = int(out.sequences[0, -1].item())
 
-            # Early exit if we already hit EOS on the first token
+            # NOTE: We intentionally do NOT check for EOS on the prefill's
+            # first token.  The prefill runs with eos_token_id stripped
+            # (see _sanitize_prefill_kwargs), so the model CAN emit the EOS
+            # id purely by chance — it doesn't actually mean "end of speech".
+            # The real EOS check happens inside the megakernel decode loop
+            # below, where the model has proper autoregressive context.
             if eos_set and first_token in eos_set:
-                logger.debug("Megakernel: EOS on first token — empty utterance")
-                return out
+                logger.warning(
+                    f"Megakernel: prefill produced EOS-like token {first_token} — "
+                    f"ignoring (prefill ran without EOS awareness)"
+                )
 
             # ── Step 2: megakernel decode loop ────────────────────────────────
             device = inputs_embeds.device
