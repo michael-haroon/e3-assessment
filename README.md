@@ -34,6 +34,8 @@ Run the deterministic parity harness:
 
 ```bash
 python benchmarks/parity_test.py --prompt "Hello" --steps 10 --seed 1234
+# optional full-path check (includes vocoder; heavier):
+python benchmarks/parity_test.py --prompt "Hello" --steps 10 --seed 1234 --keep-vocoder
 ```
 
 What it does:
