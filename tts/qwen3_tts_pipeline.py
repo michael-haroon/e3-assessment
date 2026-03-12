@@ -52,6 +52,7 @@ _CHUNK_BYTES   = _CHUNK_SAMPLES * 2             # int16 -> 7200 bytes
 # Reasonable upper bound — prevents runaway generation.
 # At ~120 codec tok/s, 300 tokens ≈ 2.5s. Raise if you need longer utterances.
 _MAX_TOKENS_HARD_CAP = 300
+_DEFAULT_MAX_NEW_TOKENS = 40
 
 
 class Qwen3TTSPipeline:
@@ -67,7 +68,7 @@ class Qwen3TTSPipeline:
         model_name: str = MODEL_NAME,
         speaker: str = "Ryan",
         language: str = "English",
-        max_new_tokens: int = int(os.getenv("TTS_MAX_TOKENS", "150")),
+        max_new_tokens: int = int(os.getenv("TTS_MAX_TOKENS", str(_DEFAULT_MAX_NEW_TOKENS))),
         verbose: bool = True,
     ):
         self.model_name     = model_name
@@ -173,6 +174,81 @@ class Qwen3TTSPipeline:
         original_generate = inner_lm.generate
         mk_stats: dict = {}
 
+        def _copy_prefill_kv_to_talker(prefill_out) -> int:
+            """Copy HF prefill cache into megakernel flat KV buffers."""
+            pkv = getattr(prefill_out, "past_key_values", None)
+            if pkv is None:
+                return 0
+
+            # HF can return either a DynamicCache-like object or a tuple/list.
+            if hasattr(pkv, "to_legacy_cache"):
+                pkv = pkv.to_legacy_cache()
+            elif hasattr(pkv, "key_cache") and hasattr(pkv, "value_cache"):
+                pkv = list(zip(pkv.key_cache, pkv.value_cache))
+
+            if not isinstance(pkv, (list, tuple)):
+                return 0
+
+            seq_len = 0
+            n_layers = min(len(pkv), talker._k_cache.shape[0])
+            for layer_idx in range(n_layers):
+                layer = pkv[layer_idx]
+                if not isinstance(layer, (list, tuple)) or len(layer) < 2:
+                    continue
+                k, v = layer[0], layer[1]
+                if k is None or v is None:
+                    continue
+
+                # Expected HF shape: [B, KV_HEADS, T, HEAD_DIM]
+                if k.dim() != 4 or v.dim() != 4:
+                    continue
+                k = k[:1].to(device=talker._k_cache.device, dtype=talker._k_cache.dtype)
+                v = v[:1].to(device=talker._v_cache.device, dtype=talker._v_cache.dtype)
+
+                t = min(k.shape[2], talker._k_cache.shape[2])
+                h = min(k.shape[1], talker._k_cache.shape[1])
+                d = min(k.shape[3], talker._k_cache.shape[3])
+                talker._k_cache[layer_idx, :h, :t, :d].copy_(k[0, :h, :t, :d])
+                talker._v_cache[layer_idx, :h, :t, :d].copy_(v[0, :h, :t, :d])
+                seq_len = max(seq_len, t)
+
+            talker._position = seq_len
+            return seq_len
+
+        def _predict_residual_codebooks(first_codebook_token: int, hidden_1024: torch.Tensor) -> torch.Tensor:
+            """Predict codebooks 2..16 using the talker code_predictor path."""
+            num_groups = int(getattr(inner_lm.config, "num_code_groups", 16))
+            codec_ids = torch.zeros(1, num_groups, dtype=torch.long, device=hidden_1024.device)
+            codec_ids[0, 0] = int(first_codebook_token)
+
+            code_predictor = getattr(inner_lm, "code_predictor", None)
+            if code_predictor is None:
+                return codec_ids
+
+            with torch.no_grad():
+                input_ids = torch.tensor([[int(first_codebook_token)]], dtype=torch.long, device=hidden_1024.device)
+                last_id_hidden = inner_lm.get_input_embeddings()(input_ids)
+                predictor_inputs = torch.cat((hidden_1024.unsqueeze(1), last_id_hidden), dim=1)
+
+                predictor_result = code_predictor.generate(
+                    inputs_embeds=predictor_inputs,
+                    max_new_tokens=num_groups - 1,
+                    do_sample=kwargs.get("subtalker_dosample", False),
+                    top_p=kwargs.get("subtalker_top_p", 1.0),
+                    top_k=kwargs.get("subtalker_top_k", 0),
+                    temperature=kwargs.get("subtalker_temperature", 1.0),
+                    return_dict_in_generate=True,
+                )
+
+                # `sequences` may include prompt tokens depending on generate impl.
+                residual = predictor_result.sequences
+                if residual.shape[-1] > (num_groups - 1):
+                    residual = residual[..., -(num_groups - 1):]
+                residual = residual.to(device=hidden_1024.device, dtype=torch.long)
+                codec_ids[0, 1 : 1 + residual.shape[-1]] = residual[0]
+
+            return codec_ids
+
         def _megakernel_generate(inputs_embeds=None, input_ids=None, **kwargs):
             from transformers.generation import GenerateDecoderOnlyOutput
 
@@ -200,6 +276,8 @@ class Qwen3TTSPipeline:
                     input_ids=input_ids,
                     max_new_tokens=1,
                     min_new_tokens=1,
+                    return_dict_in_generate=True,
+                    use_cache=True,
                     **{k: v for k, v in kwargs.items()
                        if k not in ("max_new_tokens", "min_new_tokens",
                                     "eos_token_id")}
@@ -215,6 +293,9 @@ class Qwen3TTSPipeline:
             # ── Step 2: megakernel decode loop ────────────────────────────────
             device = inputs_embeds.device
             talker.reset()
+            prefill_seq_len = _copy_prefill_kv_to_talker(out)
+            if prefill_seq_len > 0:
+                logger.debug(f"Megakernel: imported prefill KV cache (seq_len={prefill_seq_len})")
             generated    = [first_token]
             fake_hiddens = []
             t0           = time.perf_counter()
@@ -230,8 +311,10 @@ class Qwen3TTSPipeline:
                     .unsqueeze(0)
                     .clone()   # (1, 1, 1024)
                 )
-                codec_ids       = torch.zeros(1, 16, dtype=torch.long, device=device)
-                codec_ids[0, 0] = tok
+                codec_ids = _predict_residual_codebooks(
+                    first_codebook_token=tok,
+                    hidden_1024=talker._hidden,
+                )
                 fake_hiddens.append(((layer_hidden,), codec_ids))
 
                 generated.append(tok)

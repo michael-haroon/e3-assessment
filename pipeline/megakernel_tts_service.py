@@ -90,7 +90,7 @@ class MegakernelTTSService(TTSService):
     ──────────
     voice:           CosyVoice speaker ID (default "ryan")
     max_new_tokens:  hard cap on codec tokens per utterance.
-                     150 ≈ 3-4s speech — keeps chunks short and
+                     40 ≈ 3.3s speech @ 12Hz codec rate — keeps chunks short and
                      prevents the model padding to a fixed length.
     trim_silence:    strip trailing silence/hiss from each chunk (default True)
     """
@@ -99,7 +99,7 @@ class MegakernelTTSService(TTSService):
         self,
         *,
         voice: str = "ryan",
-        max_new_tokens: int = 150,      # was 1500 — that caused 47s audio blobs
+        max_new_tokens: int = 40,
         trim_silence: bool = True,
         **kwargs,
     ):
