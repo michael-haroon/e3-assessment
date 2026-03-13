@@ -1,25 +1,39 @@
-"""
-bootstrap.py
-────────────
-Must be imported before any qwen_tts import anywhere in the process.
+"""Global import-time shims used across entry points.
 
-1. Shims flash_attn_3 → flash_attn so qwen_tts's import-time check passes
-   without the "flash-attn is not installed" warning.
-2. Safe to import multiple times (idempotent).
+Must be imported before any ``qwen_tts`` import in the process.
+
+This module is intentionally idempotent and side-effect-only.
 """
 
+import importlib
 import sys
 
-if "flash_attn" not in sys.modules:
+
+def _alias_module(dst: str, src: str) -> bool:
+    """Alias an importable module ``src`` under module name ``dst``."""
+    if dst in sys.modules:
+        return True
     try:
-        import flash_attn_3 as _fa3
-        sys.modules["flash_attn"] = _fa3
+        mod = importlib.import_module(src)
+    except Exception:
+        return False
+    sys.modules[dst] = mod
+    return True
 
-        try:
-            import flash_attn_3.flash_attn_interface as _fa3_iface
-            sys.modules["flash_attn.flash_attn_interface"] = _fa3_iface
-        except ImportError:
-            pass
 
-    except ImportError:
-        pass  # neither package present — qwen_tts will warn as normal
+def _install_flash_attn_aliases() -> None:
+    """Expose whichever flash attention package is installed as ``flash_attn``."""
+    if "flash_attn" in sys.modules:
+        return
+
+    # Prefer canonical package if present.
+    if _alias_module("flash_attn", "flash_attn"):
+        _alias_module("flash_attn.flash_attn_interface", "flash_attn.flash_attn_interface")
+        return
+
+    # Fallback: some environments provide FlashAttention v3 under flash_attn_3.
+    if _alias_module("flash_attn", "flash_attn_3"):
+        _alias_module("flash_attn.flash_attn_interface", "flash_attn_3.flash_attn_interface")
+
+
+_install_flash_attn_aliases()
