@@ -55,52 +55,6 @@ _MAX_TOKENS_HARD_CAP = 300
 _DEFAULT_MAX_NEW_TOKENS = 40
 
 
-def _sanitize_prefill_kwargs(kwargs: dict) -> tuple[dict, dict]:
-    """Remove args that the wrapper controls for the prefill call."""
-    prefill_kwargs = dict(kwargs)
-    removed = {}
-    for key in (
-        "max_new_tokens",
-        "min_new_tokens",
-        "eos_token_id",
-        "return_dict_in_generate",
-        "use_cache",
-    ):
-        if key in prefill_kwargs:
-            removed[key] = prefill_kwargs.pop(key)
-    return prefill_kwargs, removed
-
-
-def _normalize_predictor_hidden(hidden: torch.Tensor) -> torch.Tensor:
-    """Normalize megakernel hidden state to predictor shape [B, T, H]."""
-    if hidden.dim() == 1:
-        return hidden.view(1, 1, -1)
-    if hidden.dim() == 2:
-        if hidden.shape[0] != 1:
-            raise ValueError(f"Expected hidden shape [1, H] for rank-2, got {tuple(hidden.shape)}")
-        return hidden.unsqueeze(1)
-    if hidden.dim() == 3:
-        if hidden.shape[0] != 1:
-            raise ValueError(f"Expected hidden batch=1 for rank-3, got {tuple(hidden.shape)}")
-        return hidden
-    raise ValueError(f"Expected hidden rank in (1,2,3), got shape={tuple(hidden.shape)}")
-
-
-def _build_predictor_generate_kwargs(kwargs: dict) -> dict:
-    """Extract code_predictor.generate() kwargs from talker.generate() kwargs."""
-    return {
-        "do_sample": kwargs.get("subtalker_dosample", False),
-        "top_p": kwargs.get("subtalker_top_p", 1.0),
-        "top_k": kwargs.get("subtalker_top_k", 0),
-        "temperature": kwargs.get("subtalker_temperature", 1.0),
-        # Must match the native forward() path which passes both of these.
-        # output_hidden_states=True is required for the code_predictor's
-        # _update_model_kwargs_for_generation to propagate generation_steps,
-        # which selects the correct per-codebook embedding table and lm_head.
-        "output_hidden_states": True,
-        "return_dict_in_generate": True,
-    }
-
 
 class Qwen3TTSPipeline:
     """
@@ -213,261 +167,205 @@ class Qwen3TTSPipeline:
         """
         generate_custom_voice() with megakernel replacing the inner LM decode loop.
         """
-        talker   = self._talker
         inner_lm = self._qwen_model.model.talker
-
-        # Always keep talker in sync with current max_new_tokens
-        talker.max_new_tokens = self.max_new_tokens
-
         original_generate = inner_lm.generate
         mk_stats: dict = {}
-        predictor_generate_kwargs: dict = {}
-
-        def _copy_prefill_kv_to_talker(prefill_out) -> dict:
-            """Copy HF prefill cache into megakernel flat KV buffers."""
-            pkv = getattr(prefill_out, "past_key_values", None)
-            if pkv is None:
-                return {"ok": False, "reason": "missing past_key_values", "seq_len": 0, "layers_copied": 0}
-
-            # HF can return either a DynamicCache-like object or a tuple/list.
-            if hasattr(pkv, "to_legacy_cache"):
-                pkv = pkv.to_legacy_cache()
-            elif hasattr(pkv, "key_cache") and hasattr(pkv, "value_cache"):
-                pkv = list(zip(pkv.key_cache, pkv.value_cache))
-
-            if not isinstance(pkv, (list, tuple)):
-                return {"ok": False, "reason": f"unexpected pkv type={type(pkv).__name__}", "seq_len": 0, "layers_copied": 0}
-
-            seq_len = 0
-            layers_copied = 0
-            n_expected_layers = int(talker._k_cache.shape[0])
-            n_layers = min(len(pkv), n_expected_layers)
-            # Debug: what's actually in the cache?
-            k0 = pkv[0][0]
-            logger.info(f"DEBUG KV cache: pkv[0][0].shape={tuple(k0.shape)} n_layers={len(pkv)}")
-            for layer_idx in range(n_layers):
-                layer = pkv[layer_idx]
-                if not isinstance(layer, (list, tuple)) or len(layer) < 2:
-                    continue
-                k, v = layer[0], layer[1]
-                if k is None or v is None:
-                    continue
-
-                # Expected HF shape: [B, KV_HEADS, T, HEAD_DIM]
-                if k.dim() != 4 or v.dim() != 4:
-                    continue
-                k = k[:1].to(device=talker._k_cache.device, dtype=talker._k_cache.dtype)
-                v = v[:1].to(device=talker._v_cache.device, dtype=talker._v_cache.dtype)
-
-                t = min(k.shape[2], talker._k_cache.shape[2])
-                h = min(k.shape[1], talker._k_cache.shape[1])
-                d = min(k.shape[3], talker._k_cache.shape[3])
-                talker._k_cache[layer_idx, :h, :t, :d].copy_(k[0, :h, :t, :d])
-                talker._v_cache[layer_idx, :h, :t, :d].copy_(v[0, :h, :t, :d])
-                seq_len = max(seq_len, t)
-                layers_copied += 1
-
-            talker._position = seq_len
-            ok = seq_len > 0 and layers_copied >= max(1, int(0.8 * n_expected_layers))
-            reason = "ok" if ok else (
-                f"insufficient cache copy: seq_len={seq_len} layers_copied={layers_copied}/{n_expected_layers}"
-            )
-            return {
-                "ok": ok,
-                "reason": reason,
-                "seq_len": seq_len,
-                "layers_copied": layers_copied,
-            }
-
-        # ── Grab the talker's final RMS norm so we can apply it to the
-        #    megakernel's raw hidden state.  The megakernel _hidden buffer is
-        #    the *pre-norm* residual stream output.  The native forward()
-        #    path feeds code_predictor the *post-norm* hidden (i.e. after
-        #    model.norm()).  Without this, codebooks 1-15 are conditioned on
-        #    the wrong representation and the vocoder produces garbled audio.
-        _talker_final_norm = inner_lm.model.norm
-
-        def _predict_residual_codebooks(first_codebook_token: int, hidden_1024: torch.Tensor) -> torch.Tensor:
-            """Predict codebooks 2..16 using the talker code_predictor path."""
-            num_groups = int(getattr(inner_lm.config, "num_code_groups", 16))
-            codec_ids = torch.zeros(1, num_groups, dtype=torch.long, device=hidden_1024.device)
-            codec_ids[0, 0] = int(first_codebook_token)
-
-            code_predictor = getattr(inner_lm, "code_predictor", None)
-            if code_predictor is None:
-                return codec_ids
-
-            try:
-                with torch.no_grad():
-                    # Apply the talker's final RMS norm to match the native
-                    # forward() path — this is the critical fix for garbled
-                    # audio.  _hidden from the megakernel is pre-norm; the
-                    # code_predictor expects post-norm.
-                    past_hidden = _normalize_predictor_hidden(
-                        _talker_final_norm(hidden_1024)
-                    )
-                    input_ids = torch.tensor([[int(first_codebook_token)]], dtype=torch.long, device=hidden_1024.device)
-                    last_id_hidden = inner_lm.get_input_embeddings()(input_ids)
-                    # Keep predictor inputs on the embedding dtype (typically bf16)
-                    # to avoid matmul dtype mismatches inside code_predictor.
-                    past_hidden = past_hidden.to(
-                        device=last_id_hidden.device,
-                        dtype=last_id_hidden.dtype,
-                    )
-
-                    if past_hidden.dim() != 3 or last_id_hidden.dim() != 3:
-                        raise ValueError(
-                            f"predictor input rank mismatch: past_hidden={tuple(past_hidden.shape)} "
-                            f"last_id_hidden={tuple(last_id_hidden.shape)}"
-                        )
-                    if past_hidden.shape[0] != last_id_hidden.shape[0] or past_hidden.shape[2] != last_id_hidden.shape[2]:
-                        raise ValueError(
-                            f"predictor shape mismatch: past_hidden={tuple(past_hidden.shape)} "
-                            f"last_id_hidden={tuple(last_id_hidden.shape)}"
-                        )
-
-                    logger.debug(
-                        "Megakernel predictor inputs: "
-                        f"past_hidden={tuple(past_hidden.shape)}:{past_hidden.dtype} "
-                        f"last_id_hidden={tuple(last_id_hidden.shape)}:{last_id_hidden.dtype}"
-                    )
-                    predictor_inputs = torch.cat((past_hidden, last_id_hidden), dim=1)
-
-                    predictor_result = code_predictor.generate(
-                        inputs_embeds=predictor_inputs,
-                        max_new_tokens=num_groups - 1,
-                        **predictor_generate_kwargs,
-                    )
-
-                    residual = predictor_result.sequences
-                    if residual.dim() != 2:
-                        raise ValueError(f"Unexpected predictor sequences shape={tuple(residual.shape)}")
-                    if residual.shape[-1] > (num_groups - 1):
-                        residual = residual[..., -(num_groups - 1):]
-                    residual = residual.to(device=hidden_1024.device, dtype=torch.long)
-                    codec_ids[0, 1 : 1 + residual.shape[-1]] = residual[0]
-            except Exception as exc:
-                logger.warning(
-                    f"Megakernel predictor failed ({exc!r}) — using first codebook only for this step"
-                )
-
-            return codec_ids
 
         def _megakernel_generate(inputs_embeds=None, input_ids=None, **kwargs):
-            from transformers.generation import GenerateDecoderOnlyOutput
-
-            # ── Token limit ───────────────────────────────────────────────────
-            # BEFORE: min(max_new_tokens, 600) — the 600 hardcap overrode
-            # everything and caused 47s audio blobs.
-            # NOW: respect whatever was passed, clamped to _MAX_TOKENS_HARD_CAP.
             max_tokens = min(
-                kwargs.get("max_new_tokens", talker.max_new_tokens),
+                kwargs.get("max_new_tokens", self.max_new_tokens),
                 _MAX_TOKENS_HARD_CAP,
             )
 
-            # ── EOS token set ─────────────────────────────────────────────────
+            # ── Step 1: HF prefill (1 step) to get text-prefix KV cache ──────
+            prefill_kwargs = {
+                **kwargs,
+                "max_new_tokens": 1,
+                "min_new_tokens": 1,   # prevent conflict with talker's min_new_tokens=2
+                "return_dict_in_generate": True,
+                "use_cache": True,
+                "output_hidden_states": True,
+            }
+            with torch.no_grad():
+                prefill_out = original_generate(
+                    inputs_embeds=inputs_embeds, **prefill_kwargs
+                )
+
+            first_token = int(prefill_out.sequences[0, 0].item())
+            past_kv     = prefill_out.past_key_values
+            N_prefix    = past_kv.get_seq_length()
+
+            # ── Step 2: Copy HF KV cache → kernel ────────────────────────────
+            # New DynamicCache API (transformers ≥ 4.46 layer-per-object style):
+            #   past_kv.layers[i].keys   shape [1, num_kv_heads, seq_len, head_dim]
+            # Kernel KV shape: [num_layers, num_kv_heads, max_seq_len, head_dim]
+            #
+            # IMPORTANT: past_kv has N_prefix = N_text + 1 positions.
+            # The +1 is from HF's one decode step that already processed
+            # first_token (putting its KV at position N_text).
+            # We copy only the N_text text-context positions so the kernel
+            # starts clean; step(first_token) then fills position N_text
+            # exactly as HF decode step 0 did — no double-processing.
+            from megakernel.tts_talker_decoder import NUM_LAYERS
+            N_text = N_prefix - 1   # strip the one HF decode step
+            self._talker.reset()
+            for layer_idx in range(NUM_LAYERS):
+                layer = past_kv.layers[layer_idx]   # DynamicLayer
+                k = layer.keys    # [1, 8, N_prefix, 128]
+                v = layer.values
+                self._talker._k_cache[layer_idx, :, :N_text, :] = k[0, :, :N_text, :]
+                self._talker._v_cache[layer_idx, :, :N_text, :] = v[0, :, :N_text, :]
+            self._talker._position = N_text
+
+            # past_hidden for first code_predictor call = last layer output
+            # from the HF prefill step (hidden_states[0] = prefill forward).
+            # hidden_states[0][0][-1][:, -1:] = last layer, last position.
+            past_hidden = (
+                prefill_out.hidden_states[0][0][-1][:, -1:].detach()
+            )  # [1, 1, 1024]
+
+            # ── Step 3: EOS set ───────────────────────────────────────────────
             raw_eos = kwargs.get("eos_token_id", [])
             if isinstance(raw_eos, int):
                 raw_eos = [raw_eos]
             elif isinstance(raw_eos, torch.Tensor):
                 raw_eos = raw_eos.tolist()
             eos_set = set(int(x) for x in raw_eos if x is not None)
-            predictor_generate_kwargs.clear()
-            predictor_generate_kwargs.update(_build_predictor_generate_kwargs(kwargs))
 
-            # ── Step 1: PyTorch prefill (one token) ───────────────────────────
-            prefill_kwargs, removed_prefill = _sanitize_prefill_kwargs(kwargs)
-            if removed_prefill:
-                logger.debug(
-                    "Megakernel prefill overrides caller kwargs: "
-                    + ", ".join(f"{k}={v!r}" for k, v in removed_prefill.items())
-                )
-
-            with torch.no_grad():
-                out = original_generate(
-                    inputs_embeds=inputs_embeds,
-                    input_ids=input_ids,
-                    max_new_tokens=1,
-                    min_new_tokens=1,
-                    return_dict_in_generate=True,
-                    use_cache=True,
-                    **prefill_kwargs,
-                )
-
-            first_token = int(out.sequences[0, -1].item())
-
-            # NOTE: We intentionally do NOT check for EOS on the prefill's
-            # first token.  The prefill runs with eos_token_id stripped
-            # (see _sanitize_prefill_kwargs), so the model CAN emit the EOS
-            # id purely by chance — it doesn't actually mean "end of speech".
-            # The real EOS check happens inside the megakernel decode loop
-            # below, where the model has proper autoregressive context.
-            if eos_set and first_token in eos_set:
-                logger.warning(
-                    f"Megakernel: prefill produced EOS-like token {first_token} — "
-                    f"ignoring (prefill ran without EOS awareness)"
-                )
-
-            # ── Step 2: megakernel decode loop ────────────────────────────────
-            device = inputs_embeds.device
-            talker.reset()
-            handoff = _copy_prefill_kv_to_talker(out)
-            logger.info(f"DEBUG handoff seq_len={handoff['seq_len']} out.sequences shape={out.sequences.shape} out.sequences[0]={out.sequences[0].tolist()}")
-            if not handoff["ok"]:
-                raise RuntimeError(f"Megakernel KV handoff failed: {handoff['reason']}")
-            logger.debug(
-                "Megakernel: imported prefill KV cache "
-                f"(seq_len={handoff['seq_len']}, layers={handoff['layers_copied']})"
+            # ── Step 4: helpers ────────────────────────────────────────────────
+            dummy_hs = torch.zeros(
+                1, 1, inner_lm.config.hidden_size,
+                dtype=torch.bfloat16, device="cuda",
             )
-            generated    = [first_token]
-            fake_hiddens = []
-            t0           = time.perf_counter()
-            token_id     = first_token
+            num_code_groups = inner_lm.config.num_code_groups  # 16
+            codec_embed_fn  = inner_lm.get_input_embeddings()  # codec_embedding
+            cp_embed_fns    = inner_lm.code_predictor.get_input_embeddings()  # ModuleList[15]
 
-            # max_tokens - 1 because we already have first_token
-            for step in range(max_tokens - 1):
-                tok = talker.step(token_id)
+            # Text conditioning passed from outer model.generate()
+            trailing_text_hidden = kwargs.get("trailing_text_hidden")  # [1, T, H]
+            tts_pad_embed        = kwargs.get("tts_pad_embed")         # [1, 1, H]
 
-                layer_hidden = (
-                    talker._hidden
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                    .clone()   # (1, 1, 1024)
+            suppress_list = kwargs.get("suppress_tokens", [])
+            suppress_t = (
+                torch.tensor(suppress_list, dtype=torch.long, device="cuda")
+                if suppress_list else None
+            )
+
+            def _run_predictor(cb0_token, ph):
+                """Predict cb1..cb15 given cb0 and past_hidden. Returns [1, 16]."""
+                cb0_id = torch.tensor([[cb0_token]], dtype=torch.long, device="cuda")
+                cb0_embed = codec_embed_fn(cb0_id)  # [1, 1, H]
+                with torch.no_grad():
+                    pred = inner_lm.code_predictor.generate(
+                        inputs_embeds=torch.cat((ph, cb0_embed), dim=1),
+                        max_new_tokens=num_code_groups - 1,
+                        do_sample=kwargs.get("subtalker_dosample", True),
+                        top_p=kwargs.get("subtalker_top_p", 1.0),
+                        temperature=kwargs.get("subtalker_temperature", 0.9),
+                        return_dict_in_generate=True,
+                        use_cache=True,
+                    )
+                return torch.cat([cb0_id, pred.sequences], dim=-1)  # [1, 16]
+
+            def _combined_embed(cb0_token, codec_ids, gen_step):
+                """
+                Replicate the HF talker's input embedding:
+                  sum(codec_embed(cb0), cp_embed[0](cb1), ..., cp_embed[14](cb15))
+                  + trailing_text_hidden[gen_step]  (or tts_pad_embed)
+                Returns [H] bfloat16 — ready to inject into _embed_weight row.
+                """
+                cb0_e = codec_embed_fn(codec_ids[:, 0:1])  # [1, 1, H]
+                parts = [cb0_e]
+                for i in range(num_code_groups - 1):
+                    parts.append(cp_embed_fns[i](codec_ids[:, i + 1 : i + 2]))
+                codec_sum = torch.stack(parts, dim=0).sum(0)  # [1, 1, H]
+                if gen_step < trailing_text_hidden.shape[1]:
+                    text_cond = trailing_text_hidden[:, gen_step : gen_step + 1]
+                else:
+                    text_cond = tts_pad_embed
+                combined = codec_sum + text_cond  # [1, 1, H]
+                return combined[0, 0]  # [H] bfloat16
+
+            def _kernel_step_with_embed(token_id, embed_vec):
+                """Run kernel step() but use embed_vec instead of plain lookup."""
+                orig = self._talker._embed_weight[token_id].clone()
+                self._talker._embed_weight[token_id] = embed_vec
+                self._talker.step(token_id)
+                self._talker._embed_weight[token_id] = orig
+
+            def _next_token_from_logits():
+                """Compute next cb0 from _norm_out with suppress_tokens."""
+                logits = (
+                    self._talker._norm_out.float()
+                    @ self._talker._lm_head_weight.float().T
                 )
-                codec_ids = _predict_residual_codebooks(
-                    first_codebook_token=tok,
-                    hidden_1024=layer_hidden,
-                )
-                fake_hiddens.append(((layer_hidden,), codec_ids))
+                if suppress_t is not None:
+                    logits.scatter_(0, suppress_t, float("-inf"))
+                return int(logits.argmax().item())
 
-                generated.append(tok)
-                token_id = tok
+            # ── Step 5 + 6: Decode loop ───────────────────────────────────────
+            # At each step the code_predictor runs FIRST (cb1..cb15 are part of
+            # the combined input embedding), then the kernel processes the
+            # combined embedding through the 28-layer transformer.
+            all_codec_ids = []
+            all_tokens    = []
+            current_cb0   = first_token
+            ph            = past_hidden   # from HF prefill
+            gen_step      = 0
 
-                # Stop as soon as we see EOS — don't pad to the limit
-                if eos_set and tok in eos_set:
-                    logger.debug(f"Megakernel: EOS at step {step+1}/{max_tokens}")
+            t0 = time.perf_counter()
+            for _ in range(max_tokens):
+                all_tokens.append(current_cb0)
+
+                # a) code_predictor → cb1..cb15 for this cb0
+                cids = _run_predictor(current_cb0, ph)
+                all_codec_ids.append(cids)
+
+                # b) stop if EOS (codec_ids already recorded for outer stripping)
+                if current_cb0 in eos_set:
                     break
 
+                # c) combined embed → kernel step → next token
+                embed_vec = _combined_embed(current_cb0, cids, gen_step)
+                _kernel_step_with_embed(current_cb0, embed_vec)
+                current_cb0 = _next_token_from_logits()
+
+                # d) past_hidden for next code_predictor = kernel's normed output
+                ph = (
+                    self._talker._norm_out
+                    .detach().clone()
+                    .to(torch.bfloat16)
+                    .view(1, 1, -1)
+                )
+                gen_step += 1
             elapsed = time.perf_counter() - t0
+
             mk_stats.update(
-                tokens    = len(generated),
-                elapsed   = elapsed,
-                tok_per_s = len(generated) / elapsed if elapsed > 0 else 0,
-                hit_eos   = (eos_set and generated[-1] in eos_set),
-                generated_tokens=list(generated),
+                tokens=len(all_tokens),
+                elapsed=elapsed,
+                tok_per_s=len(all_tokens) / elapsed if elapsed > 0 else 0,
+                hit_eos=bool(eos_set and all_tokens[-1] in eos_set),
+                generated_tokens=list(all_tokens),
             )
             logger.info(
-                f"Megakernel: {len(generated)} tok in {elapsed*1000:.1f}ms "
+                f"Megakernel: {len(all_tokens)} tok in {elapsed*1000:.1f}ms "
                 f"({mk_stats['tok_per_s']:.0f} tok/s) "
                 f"EOS={'✅' if mk_stats['hit_eos'] else '❌ hit token limit'}"
             )
 
-            return GenerateDecoderOnlyOutput(
-                sequences    = torch.tensor(
-                    [generated], dtype=torch.long, device=device
-                ),
-                hidden_states = tuple(fake_hiddens),
-            )
+            # ── Step 7: Build fake GenerateOutput for model.generate() ────────
+            # Outer generate (Qwen3TTSForConditionalGeneration.generate) reads:
+            #   hid[-1]    → codec_ids [1, 16]         (used for audio)
+            #   hid[0][-1] → last layer hidden [1,1,H]  (discarded via _)
+            class _FakeOut:
+                sequences     = torch.tensor(
+                    [all_tokens], dtype=torch.long, device="cuda"
+                )
+                hidden_states = tuple(
+                    ((dummy_hs,), cids) for cids in all_codec_ids
+                )  # materialised tuple so outer code can iterate it twice
+
+            return _FakeOut()
 
         inner_lm.generate = _megakernel_generate
         try:
