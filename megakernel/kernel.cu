@@ -1213,10 +1213,8 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
 
   // Reset barrier counters + flags on-device
   if (block_id == 0 && threadIdx.x == 0) {
-    *barrier_counter = 0;
-    *barrier_sense = 0;
-    atomicExch(kv_flag, 0u);
-    atomicExch(attn_flag, 0u);
+    if (kv_flag) atomicExch(kv_flag, 0u);
+    if (attn_flag) atomicExch(attn_flag, 0u);
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -1331,10 +1329,8 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   int num_blocks = gridDim.x;
 
   if (block_id == 0 && threadIdx.x == 0) {
-    *barrier_counter = 0;
-    *barrier_sense = 0;
-    atomicExch(kv_flag, 0u);
-    atomicExch(attn_flag, 0u);
+    if (kv_flag) atomicExch(kv_flag, 0u);
+    if (attn_flag) atomicExch(attn_flag, 0u);
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -1486,6 +1482,10 @@ extern "C" void launch_ldg_decode_direct(
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
 
+  cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
+  cudaMemsetAsync(d_barrier_sense,   0, sizeof(unsigned int), stream);
+
+
   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
       (const __nv_bfloat16 *)embed_weight, layer_weights,
       (const __nv_bfloat16 *)final_norm_weight,
@@ -1494,7 +1494,7 @@ extern "C" void launch_ldg_decode_direct(
       (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
       (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
       (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
-      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      d_barrier_counter, d_barrier_sense, nullptr, nullptr, num_layers,
       position, input_token_id, max_seq_len, attn_scale);
 
   cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
@@ -1532,7 +1532,7 @@ extern "C" void launch_ldg_decode_persistent(
       (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
       (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
       (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
-      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      d_barrier_counter, d_barrier_sense, nullptr, nullptr, num_layers,
       d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
 
   cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
@@ -1588,7 +1588,7 @@ extern "C" void launch_ldg_generate_nosync(
         (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
         (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
         (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
-        d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+        d_barrier_counter, d_barrier_sense, nullptr, nullptr, num_layers,
         d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
 
     cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
