@@ -95,7 +95,7 @@ def bench_megakernel_talker(
     ms_per_tok  = avg_elapsed * 1000 / max_tokens
 
     return {
-        "backend":     "Megakernel (talker, 20 layers)",
+        "backend":     "Megakernel (talker, 28 layers)",
         "tokens":      max_tokens,
         "runs":        n_runs,
         "avg_elapsed": avg_elapsed,
